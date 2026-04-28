@@ -801,6 +801,9 @@ public:
   // Swift._stdlib_isOSVersionAtLeastOrVariantVersionAtLeast.
   FuncDecl *getIsOSVersionAtLeastOrVariantVersionAtLeast() const;
 
+  /// Retrieve the declaration of Swift._isSwiftRuntimeVersionAtLeast.
+  FuncDecl *getIsSwiftRuntimeVersionAtLeast() const;
+
   /// Look for the declaration with the given name within the
   /// passed in module.
   void lookupInModule(ModuleDecl *M, StringRef name,
@@ -909,7 +912,7 @@ public:
   AvailabilityRange getSwiftAvailability(unsigned major, unsigned minor) const;
 
   // For each feature defined in FeatureAvailability, define two functions;
-  // the latter, with the suffix RuntimeAvailabilty, is for use with
+  // the latter, with the suffix RuntimeAvailability, is for use with
   // AvailabilityRange::forRuntimeTarget(), and only looks at the Swift
   // runtime version.
 #define FEATURE(N, V)                                                          \
@@ -1044,13 +1047,15 @@ public:
 
   // Builtin type and simple types that are used frequently.
   const CanType TheErrorType;             /// This is the ErrorType singleton.
-  const CanType TheUnresolvedType;        /// This is the UnresolvedType singleton.
   const CanType TheEmptyTupleType;        /// This is '()', aka Void
   const CanType TheEmptyPackType;
   const CanType TheAnyType;               /// This is 'Any', the empty protocol composition
   const CanType TheUnconstrainedAnyType;  /// This is 'any ~Copyable & ~Escapable',
                                           /// the empty protocol composition
                                           /// without any implicit constraints.
+  const CanGenericTypeParamType TheSelfType; /// The protocol 'Self' type;
+                                             /// a generic parameter with
+                                             /// depth 0 index 0
 #define SINGLETON_TYPE(SHORT_ID, ID) \
   const CanType The##SHORT_ID##Type;
 #include "swift/AST/TypeNodes.def"
@@ -1069,6 +1074,9 @@ public:
   /// Does any proper bookkeeping to keep all module loaders up to date as well.
   void addSearchPath(StringRef searchPath, bool isFramework, bool isSystem);
 
+  /// Adds the path to the explicitly built module \c name.
+  void addExplicitModulePath(StringRef name, std::string path);
+
   /// Adds a module loader to this AST context.
   ///
   /// \param loader The new module loader, which will be added after any
@@ -1082,7 +1090,7 @@ public:
   ///                interface.
   void addModuleLoader(std::unique_ptr<ModuleLoader> loader,
                        bool isClang = false, bool isDWARF = false,
-                       bool IsInterface = false);
+                       bool IsInterface = false, bool IsExplicit = false);
 
   /// Add a module interface checker to use for this AST context.
   void addModuleInterfaceChecker(std::unique_ptr<ModuleInterfaceChecker> checker);
@@ -1290,6 +1298,10 @@ public:
   ModuleDecl *getStdlibModule() const {
     return const_cast<ASTContext *>(this)->getStdlibModule(false);
   }
+
+  /// Names of underscored modules whose contents, if imported, should be
+  /// treated as separately-imported overlays of the standard library module.
+  ArrayRef<Identifier> StdlibOverlayNames;
 
   /// Insert an externally-sourced module into the set of known loaded modules
   /// in this context.
@@ -1542,9 +1554,9 @@ public:
   ///
   /// This is usually the check you want; for example, when introducing
   /// a new language feature which is only visible in Swift 5, you would
-  /// check for isSwiftVersionAtLeast(5).
-  bool isSwiftVersionAtLeast(unsigned major, unsigned minor = 0) const {
-    return LangOpts.isSwiftVersionAtLeast(major, minor);
+  /// check for isLanguageModeAtLeast(5).
+  bool isLanguageModeAtLeast(unsigned major, unsigned minor = 0) const {
+    return LangOpts.isLanguageModeAtLeast(major, minor);
   }
 
   /// Check whether it's important to respect access control restrictions
@@ -1601,6 +1613,10 @@ public:
   }
 
 private:
+  friend class BuiltinGenericType;
+  GenericSignature &getCachedBuiltinGenericTypeSignature(TypeKind kind);
+
+private:
   friend Decl;
 
   std::optional<ExternalSourceLocs *> getExternalSourceLocs(const Decl *D);
@@ -1622,6 +1638,10 @@ public:
   /// then this returns the universal domain (`*`).
   AvailabilityDomain getTargetAvailabilityDomain() const;
 };
+
+inline SourceLoc extractNearestSourceLoc(const ASTContext *ctx) {
+  return SourceLoc();
+}
 
 } // end namespace swift
 

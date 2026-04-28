@@ -46,6 +46,7 @@
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/PointerIntPair.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/ilist.h"
 #include "llvm/ProfileData/InstrProfReader.h"
 #include "llvm/Support/Allocator.h"
@@ -234,6 +235,10 @@ private:
   llvm::StringMap<SILFunction *> FunctionTable;
   llvm::StringMap<SILFunction *> ZombieFunctionTable;
 
+  /// Lookup table for SIL functions by their asmnames, for those that
+  /// have them.
+  llvm::StringMap<SILFunction *> FunctionByAsmNameTable;
+
   /// The list of SILFunctions in the module.
   FunctionListType functions;
 
@@ -255,8 +260,13 @@ private:
       VTableEntryCache;
 
   /// Lookup table for SIL witness tables from conformances.
-  llvm::DenseMap<const ProtocolConformance *, SILWitnessTable *>
+  llvm::DenseMap<const RootProtocolConformance *, SILWitnessTable *>
   WitnessTableMap;
+
+  /// Lookup table for specialized witness tables from conformances.
+  /// Currently only used in embedded mode.
+  llvm::DenseMap<const ProtocolConformance *, SILWitnessTable *>
+  specializedWitnessTableMap;
 
   /// The list of SILWitnessTables in the module.
   WitnessTableListType witnessTables;
@@ -303,6 +313,9 @@ private:
 
   /// Lookup table for SIL Global Variables.
   llvm::StringMap<SILGlobalVariable *> GlobalVariableMap;
+
+  /// Lookup table for SIL Global Variables, indexed by their asmnames.
+  llvm::StringMap<SILGlobalVariable *> GlobalVariableByAsmNameMap;
 
   /// The list of SILGlobalVariables in the module.
   GlobalListType silGlobals;
@@ -389,10 +402,6 @@ private:
   bool parsedAsSerializedSIL;
 
   /// Set if we have registered a deserialization notification handler for
-  /// lowering ownership in non transparent functions.
-  /// This gets set in NonTransparent OwnershipModelEliminator pass.
-  bool regDeserializationNotificationHandlerForNonTransparentFuncOME;
-  /// Set if we have registered a deserialization notification handler for
   /// lowering ownership in transparent functions.
   /// This gets set in OwnershipModelEliminator pass.
   bool regDeserializationNotificationHandlerForAllFuncOME;
@@ -444,14 +453,8 @@ public:
     deserializationNotificationHandlers.erase(handler);
   }
 
-  bool hasRegisteredDeserializationNotificationHandlerForNonTransparentFuncOME() {
-    return regDeserializationNotificationHandlerForNonTransparentFuncOME;
-  }
   bool hasRegisteredDeserializationNotificationHandlerForAllFuncOME() {
     return regDeserializationNotificationHandlerForAllFuncOME;
-  }
-  void setRegisteredDeserializationNotificationHandlerForNonTransparentFuncOME() {
-    regDeserializationNotificationHandlerForNonTransparentFuncOME = true;
   }
   void setRegisteredDeserializationNotificationHandlerForAllFuncOME() {
     regDeserializationNotificationHandlerForAllFuncOME = true;
@@ -594,6 +597,12 @@ public:
 
   /// Erase a global SIL variable from the module.
   void eraseGlobalVariable(SILGlobalVariable *G);
+
+  /// Erase a differentiability witness from the module.
+  void eraseDifferentiabilityWitness(SILDifferentiabilityWitness *dw);
+
+  /// Erase all differentiability witnesses for function f.
+  void eraseAllDifferentiabilityWitnesses(SILFunction *f);
 
   /// Create and return an empty SIL module suitable for generating or parsing
   /// SIL into.
@@ -820,14 +829,20 @@ public:
   /// Look for a global variable by name.
   ///
   /// \return null if this module has no such global variable
-  SILGlobalVariable *lookUpGlobalVariable(StringRef name) const {
+  SILGlobalVariable *lookUpGlobalVariable(StringRef name,
+                                          bool byAsmName = false) const {
+    if (byAsmName)
+      return GlobalVariableByAsmNameMap.lookup(name);
+
     return GlobalVariableMap.lookup(name);
   }
 
   /// Look for a function by name.
   ///
   /// \return null if this module has no such function
-  SILFunction *lookUpFunction(StringRef name) const {
+  SILFunction *lookUpFunction(StringRef name, bool byAsmName = false) const {
+    if (byAsmName)
+      return FunctionByAsmNameTable.lookup(name);
     return FunctionTable.lookup(name);
   }
 
@@ -862,19 +877,25 @@ public:
   /// Returns true if linking succeeded, false otherwise.
   bool linkFunction(SILFunction *F, LinkingMode LinkMode);
 
+  /// Attempt to deserialize witness table for protocol conformance \p PC.
+  ///
+  /// Returns true if linking succeeded, false otherwise.
+  bool linkWitnessTable(ProtocolConformance *PC, LinkingMode LinkMode);
+
   /// Check if a given function exists in any of the modules.
   /// i.e. it can be linked by linkFunction.
   bool hasFunction(StringRef Name);
 
-  /// Look up the SILWitnessTable representing the lowering of a protocol
-  /// conformance, and collect the substitutions to apply to the referenced
-  /// witnesses, if any.
-  ///
-  /// \arg C The protocol conformance mapped key to use to lookup the witness
-  ///        table.
-  /// \arg deserializeLazily If we cannot find the witness table should we
-  ///                        attempt to lazily deserialize it.
+  /// Look up the SILWitnessTable representing the lowering of a conformance `C`.
+  /// If a specialized witness table exists for the conformance, return the specialized table.
+  /// Specialized witness tables are currently only used in embedded mode.
   SILWitnessTable *lookUpWitnessTable(const ProtocolConformance *C);
+
+  /// Look up the SILWitnessTable representing the lowering of a conformance `C`.
+  /// The `isSpecialized` flag specifies if only non-specialized or specialized witness
+  /// tables are looked up.
+  /// Specialized witness tables are currently only used in embedded mode.
+  SILWitnessTable *lookUpWitnessTable(const ProtocolConformance *C, bool isSpecialized);
 
   /// Attempt to lookup \p Member in the witness table for \p C.
   ///
@@ -1140,10 +1161,18 @@ inline llvm::raw_ostream &operator<<(llvm::raw_ostream &OS, const SILModule &M){
   return OS;
 }
 
-void verificationFailure(const Twine &complaint,
-              const SILInstruction *atInstruction,
-              const SILArgument *atArgument,
-              const std::function<void()> &extraContext);
+void verificationFailure(
+    const Twine &complaint, const SILFunction *fn,
+    llvm::function_ref<void(SILPrintContext &ctx)> extraContext);
+void verificationFailure(
+    const Twine &complaint, const SILInstruction *atInstruction,
+    llvm::function_ref<void(SILPrintContext &ctx)> extraContext);
+void verificationFailure(
+    const Twine &complaint, const SILArgument *atArgument,
+    llvm::function_ref<void(SILPrintContext &ctx)> extraContext);
+void verificationFailure(
+    const Twine &complaint, SILValue atValue,
+    llvm::function_ref<void(SILPrintContext &ctx)> extraContext);
 
 inline bool SILOptions::supportsLexicalLifetimes(const SILModule &mod) const {
   switch (mod.getStage()) {

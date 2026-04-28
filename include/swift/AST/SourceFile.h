@@ -28,6 +28,7 @@
 namespace swift {
 class ASTScope;
 class AvailabilityScope;
+class GeneratedSourceInfo;
 class PersistentParserState;
 struct SourceFileExtras;
 class Token;
@@ -136,8 +137,8 @@ private:
 
   /// Associates a list of source locations to the member declarations that must
   /// be diagnosed as being out of scope due to a missing import.
-  using DelayedMissingImportForMemberDiags =
-      llvm::SmallDenseMap<const ValueDecl *, std::vector<SourceLoc>>;
+  using DelayedMissingImportForMemberDiags = llvm::SmallDenseMap<
+      const ValueDecl *, std::vector<std::pair<SourceLoc, DiagnosticBehavior>>>;
   DelayedMissingImportForMemberDiags MissingImportForMemberDiagnostics;
 
   /// A unique identifier representing this file; used to mark private decls
@@ -470,6 +471,11 @@ public:
                 const ModuleDecl *importedModule,
                 llvm::SmallSetVector<Identifier, 4> &spiGroups) const override;
 
+  /// Returns true if any import of \p importedModule has the `@preconcurrency`
+  /// attribute.
+  virtual bool isModuleImportedPreconcurrency(
+      const ModuleDecl *importedModule) const override;
+
   // Is \p targetDecl accessible as an explicitly imported SPI from this file?
   bool isImportedAsSPI(const ValueDecl *targetDecl) const;
 
@@ -517,8 +523,9 @@ public:
   /// Add a source location for which a delayed missing import for member
   /// diagnostic should be emited.
   void addDelayedMissingImportForMemberDiagnostic(const ValueDecl *decl,
-                                                  SourceLoc loc) {
-    MissingImportForMemberDiagnostics[decl].push_back(loc);
+                                                  SourceLoc loc,
+                                                  DiagnosticBehavior limit) {
+    MissingImportForMemberDiagnostics[decl].push_back({loc, limit});
   }
 
   DelayedMissingImportForMemberDiags

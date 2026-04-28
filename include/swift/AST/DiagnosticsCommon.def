@@ -23,6 +23,13 @@
 ERROR(invalid_diagnostic,none,
       "INTERNAL ERROR: this diagnostic should not be produced", ())
 
+NOTE(kind_declname_declared_here,none,
+     "%0 %1 declared here", (DescriptiveDeclKind, DeclName))
+NOTE(decl_declared_here_with_kind,none,
+     "%kind0 declared here", (const Decl *))
+NOTE(through_decl_declared_here_with_kind,none,
+     "through %kind0 declared here", (const Decl *))
+
 ERROR(not_implemented,none,
       "INTERNAL ERROR: feature not implemented: %0", (StringRef))
 
@@ -176,9 +183,6 @@ ERROR(circular_enum_inheritance,none,
 ERROR(circular_protocol_def,none,
       "protocol %0 refines itself", (Identifier))
 
-NOTE(kind_declname_declared_here,none,
-     "%0 %1 declared here", (DescriptiveDeclKind, DeclName))
-
 WARNING(warn_property_wrapper_module_scope,none,
         "ignoring associated type %0 in favor of module-scoped property "
         "wrapper %0; please qualify the reference with %1",
@@ -212,8 +216,8 @@ ERROR(scanner_find_cycle, none,
 NOTE(scanner_find_cycle_swift_overlay_path, none,
      "Swift Overlay dependency of '%0' on '%1' via Clang module dependency: '%2'", (StringRef, StringRef, StringRef))
 
-ERROR(scanner_arguments_invalid, none,
-      "dependencies scanner cannot be configured with arguments: '%0'", (StringRef))
+NOTE(scanner_cycle_source_target_shadow_module, none,
+     "source target '%0' shadowing a%select{ |n SDK }2Swift module with the same name at: '%1'", (StringRef, StringRef, bool))
 
 ERROR(error_scanner_extra, none,
       "failed inside dependency scanner: '%0'", (StringRef))
@@ -251,8 +255,10 @@ REMARK(remark_scanner_invalidate_missing_cas, none,
 // MARK: custom attribute diagnostics
 //------------------------------------------------------------------------------
 
-ERROR(unknown_attribute,none,
+ERROR(unknown_attr_name,none,
       "unknown attribute '%0'", (StringRef))
+ERROR(unknown_type_attr,none,
+      "unknown %kind0", (const TypeAttribute *))
 
 //------------------------------------------------------------------------------
 // MARK: macro diagnostics
@@ -269,6 +275,13 @@ ERROR(macro_experimental,none,
       
 ERROR(lookup_outputs_dont_match,none,
 "Unqualified lookup output from ASTScope and SwiftLexicalLookup don't match", ())
+
+//------------------------------------------------------------------------------
+// MARK: Accessor diagnostics
+//------------------------------------------------------------------------------
+
+ERROR(accessor_not_supported_in_decl,none,
+      "%0 is supported only on a struct or enum", (StringRef))      
 
 //------------------------------------------------------------------------------
 // MARK: bridged diagnostics

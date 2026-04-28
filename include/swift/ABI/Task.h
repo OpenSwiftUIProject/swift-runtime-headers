@@ -29,6 +29,13 @@
 #include "bitset"
 #include "queue" // TODO: remove and replace with our own mpsc
 
+// Does the runtime integrate with libdispatch?
+#if defined(SWIFT_CONCURRENCY_USES_DISPATCH)
+#define SWIFT_CONCURRENCY_ENABLE_DISPATCH SWIFT_CONCURRENCY_USES_DISPATCH
+#else
+#define SWIFT_CONCURRENCY_ENABLE_DISPATCH 0
+#endif
+
 // Does the runtime provide priority escalation support?
 #ifndef SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
 #if SWIFT_CONCURRENCY_ENABLE_DISPATCH && \
@@ -154,6 +161,10 @@ public:
     return Flags.getPriority();
   }
 
+  void setPriority(JobPriority priority) {
+    Flags.setPriority(priority);
+  }
+
   uint32_t getJobId() const {
     return Id;
   }
@@ -237,10 +248,10 @@ struct ResultTypeInfo {
 #else
   size_t size = 0;
   size_t alignMask = 0;
-  void (*initializeWithCopy)(OpaqueValue *result, OpaqueValue *src) = nullptr;
+  OpaqueValue * (*initializeWithCopy)(OpaqueValue *result, OpaqueValue *src, void *type) = nullptr;
   void (*storeEnumTagSinglePayload)(OpaqueValue *v, unsigned whichCase,
-                                    unsigned emptyCases) = nullptr;
-  void (*destroy)(OpaqueValue *) = nullptr;
+                                    unsigned emptyCases, void *type) = nullptr;
+  void (*destroy)(OpaqueValue *, void *) = nullptr;
 
   bool isNull() {
     return initializeWithCopy == nullptr;
@@ -252,14 +263,14 @@ struct ResultTypeInfo {
     return alignMask + 1;
   }
   void vw_initializeWithCopy(OpaqueValue *result, OpaqueValue *src) {
-    initializeWithCopy(result, src);
+    initializeWithCopy(result, src, nullptr);
   }
   void vw_storeEnumTagSinglePayload(OpaqueValue *v, unsigned whichCase,
                                     unsigned emptyCases) {
-    storeEnumTagSinglePayload(v, whichCase, emptyCases);
+    storeEnumTagSinglePayload(v, whichCase, emptyCases, nullptr);
   }
   void vw_destroy(OpaqueValue *v) {
-    destroy(v);
+    destroy(v, nullptr);
   }
 #endif
 };

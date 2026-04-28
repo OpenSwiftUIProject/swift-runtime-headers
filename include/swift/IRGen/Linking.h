@@ -57,15 +57,10 @@ public:
   /// be promoted to public external. Used by the LLDB expression evaluator.
   bool ForcePublicDecls;
 
-  /// When true, allows duplicate external and hidden declarations by marking
-  /// them as linkonce / weak.
-  bool MergeableSymbols;
-
   explicit UniversalLinkageInfo(IRGenModule &IGM);
 
   UniversalLinkageInfo(const llvm::Triple &triple, bool hasMultipleIGMs,
-                       bool forcePublicDecls, bool isStaticLibrary,
-                       bool mergeableSymbols);
+                       bool forcePublicDecls, bool isStaticLibrary);
 
   /// In case of multiple llvm modules (in multi-threaded compilation) all
   /// private decls must be visible from other files.
@@ -1860,6 +1855,13 @@ public:
            getKind() == Kind::PartialApplyForwarderCoroFunctionPointer;
   }
 
+  /// Whether the link entity's definitions must be considered non-unique.
+  ///
+  /// This applies only in the Embedded Swift linkage model, and is used for
+  /// any symbols that have not been explicitly requested to have unique
+  /// definitions (e.g., with @used).
+  bool hasNonUniqueDefinition() const;
+
 #undef LINKENTITY_GET_FIELD
 #undef LINKENTITY_SET_FIELD
 
@@ -1893,7 +1895,7 @@ class ApplyIRLinkage {
   IRLinkage IRL;
 public:
   ApplyIRLinkage(IRLinkage IRL) : IRL(IRL) {}
-  void to(llvm::GlobalValue *GV, bool definition = true) const {
+  void to(llvm::GlobalValue *GV, bool nonAliasedDefinition = true) const {
     llvm::Module *M = GV->getParent();
     const llvm::Triple Triple(M->getTargetTriple());
 
@@ -1906,9 +1908,16 @@ public:
     if (Triple.isOSBinFormatELF())
       return;
 
-    // COMDATs cannot be applied to declarations.  If we have a definition,
-    // apply the COMDAT.
-    if (definition)
+    // COMDATs cannot be applied to declarations. Also, definitions that are
+    // exported through aliases should not have COMDATs, because the alias
+    // itself might represent an externally visible symbol but such symbols
+    // are discarded from the symtab when other object files have a COMDAT
+    // group with the same signature.
+    //
+    // If we have a non-aliased definition with ODR-based linkage, attach it
+    // to a COMDAT group so that duplicate definitions across object files
+    // can be merged by the linker.
+    if (nonAliasedDefinition)
       if (IRL.Linkage == llvm::GlobalValue::LinkOnceODRLinkage ||
           IRL.Linkage == llvm::GlobalValue::WeakODRLinkage)
         if (Triple.supportsCOMDAT())

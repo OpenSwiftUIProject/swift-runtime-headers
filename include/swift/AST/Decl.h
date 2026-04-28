@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2020 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2025 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -19,6 +19,7 @@
 
 #include "swift/AST/AccessScope.h"
 #include "swift/AST/Attr.h"
+#include "swift/AST/AvailabilityQuery.h"
 #include "swift/AST/AvailabilityRange.h"
 #include "swift/AST/CaptureInfo.h"
 #include "swift/AST/ClangNode.h"
@@ -84,6 +85,7 @@ namespace swift {
   struct ExternalSourceLocs;
   class CaptureListExpr;
   class DeclRefExpr;
+  class InverseTypeRepr;
   class LiteralExpr;
   class BraceStmt;
   class DeclAttributes;
@@ -169,6 +171,7 @@ enum class DescriptiveDeclKind : uint8_t {
   PostfixOperator,
   PrecedenceGroup,
   TypeAlias,
+  GenericTypeAlias,
   GenericTypeParam,
   AssociatedType,
   Type,
@@ -183,7 +186,6 @@ enum class DescriptiveDeclKind : uint8_t {
   GenericClass,
   GenericActor,
   GenericDistributedActor,
-  GenericType,
   Subscript,
   StaticSubscript,
   ClassSubscript,
@@ -214,7 +216,9 @@ enum class DescriptiveDeclKind : uint8_t {
   OpaqueVarType,
   Macro,
   MacroExpansion,
-  Using
+  Using,
+  BorrowAccessor,
+  MutateAccessor,
 };
 
 /// Describes which spelling was used in the source for the 'static' or 'class'
@@ -369,6 +373,12 @@ bool conflicting(ASTContext &ctx,
                  const OverloadSignature& sig2, CanType sig2Type,
                  bool *wouldConflictInSwift5 = nullptr,
                  bool skipProtocolExtensionCheck = false);
+
+/// The kind of special compiler synthesized property in a \c distributed actor,
+/// currently this includes \c id and \c actorSystem.
+enum class SpecialDistributedActorProperty {
+  Id, ActorSystem
+};
 
 /// The kind of artificial main to generate.
 enum class ArtificialMainKind : uint8_t {
@@ -751,7 +761,12 @@ protected:
     HasAnyUnavailableDuringLoweringValues : 1
   );
 
-  SWIFT_INLINE_BITFIELD(ModuleDecl, TypeDecl, 1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+8,
+  SWIFT_INLINE_BITFIELD(OpaqueTypeDecl, GenericTypeDecl, 1,
+    /// Whether we have lazily-loaded underlying substitutions.
+    HasLazyUnderlyingSubstitutions : 1
+  );
+
+  SWIFT_INLINE_BITFIELD(ModuleDecl, TypeDecl, 1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+8,
     /// If the module is compiled as static library.
     StaticLibrary : 1,
 
@@ -820,7 +835,10 @@ protected:
     SerializePackageEnabled : 1,
 
     /// Whether this module has enabled strict memory safety checking.
-    StrictMemorySafety : 1
+    StrictMemorySafety : 1,
+
+    /// Whether this module uses deferred code generation in Embedded Swift.
+    DeferredCodeGen : 1
   );
 
   SWIFT_INLINE_BITFIELD(PrecedenceGroupDecl, Decl, 1+2,
@@ -1021,7 +1039,7 @@ public:
     if (auto dc = Context.dyn_cast<DeclContext *>())
       return dc->getASTContext();
 
-    return *Context.get<ASTContext *>();
+    return *cast<ASTContext *>(Context);
   }
 
   const DeclAttributes &getAttrs() const {
@@ -1030,6 +1048,13 @@ public:
 
   DeclAttributes &getAttrs() {
     return Attrs;
+  }
+
+  /// Adds a given attribute to the Decl. This should be preferred over
+  /// \c getAttrs().add(...) since it also attaches the attribute if necessary.
+  void addAttribute(DeclAttribute *attr) {
+    attr->attachToDecl(this);
+    getAttrs().add(attr);
   }
 
   /// Returns the attributes that were directly attached to this declaration
@@ -1047,12 +1072,6 @@ public:
   /// attribute macro expansion.
   DeclAttributes getSemanticAttrs() const;
 
-  /// Register the relationship between \c this and \p attr->abiDecl , assuming
-  /// that \p attr is attached to \c this . This is necessary for
-  /// \c ABIRoleInfo::ABIRoleInfo() to determine that \c attr->abiDecl
-  /// is ABI-only and locate its API counterpart.
-  void recordABIAttr(ABIAttr *attr);
-
   /// Set this declaration's attributes to the specified attribute list,
   /// applying any post-processing logic appropriate for attributes parsed
   /// from source code.
@@ -1062,10 +1081,32 @@ public:
   std::optional<ObjCSelector>
   getExplicitObjCName(bool allowInvalid = false) const;
 
+  /// Whether this declaration is exposed to C and does not expose a Swift
+  /// counterpart.
+  bool hasOnlyCEntryPoint() const;
+
   /// True if this declaration provides an implementation for an imported
   /// Objective-C declaration. This implies various restrictions and special
   /// behaviors for it and, if it's an extension, its members.
   bool isObjCImplementation() const;
+
+  /// True if this declaration should always have its implementation made
+  /// available to the client, and not have an ABI symbol.
+  ///
+  /// This can be spelled with @export(implementation) or the historical
+  /// @_alwaysEmitIntoClient.
+  bool isAlwaysEmittedIntoClient() const;
+
+  /// True if this declaration should never have its implementation made
+  /// available to any client. This overrides cross-module optimization and
+  /// optimizations that might use the implementation, such that the only
+  /// implementation of this function is the one compiled into its owning
+  /// module. Practically speaking, this prohibits serialization of the SIL
+  /// for this definition.
+  ///
+  /// This can be spelled with @export(interface) or the historical
+  /// @_neverEmitIntoClient.
+  bool isNeverEmittedIntoClient() const;
 
   using AuxiliaryDeclCallback = llvm::function_ref<void(Decl *)>;
 
@@ -1089,10 +1130,6 @@ public:
   /// declaration.
   void forEachAttachedMacro(MacroRole role, MacroCallback) const;
 
-  /// Returns the resolved macro for the given custom attribute
-  /// attached to this declaration.
-  MacroDecl *getResolvedMacro(CustomAttr *attr) const;
-
   /// Retrieve the discriminator for the given custom attribute that names
   /// an attached macro.
   unsigned getAttachedMacroDiscriminator(DeclBaseName macroName, MacroRole role,
@@ -1115,15 +1152,13 @@ public:
   std::optional<llvm::VersionTuple>
   getIntroducedOSVersion(PlatformKind Kind) const;
 
-  /// Returns the OS version in which the decl became ABI as specified by the
-  /// `@backDeployed` attribute.
-  std::optional<llvm::VersionTuple>
-  getBackDeployedBeforeOSVersion(ASTContext &Ctx,
-                                 bool forTargetVariant = false) const;
+  /// Returns the active `@backDeployed` attribute and the `AvailabilityRange`
+  /// in which the decl is available as ABI.
+  std::optional<std::pair<const BackDeployedAttr *, AvailabilityRange>>
+  getBackDeployedAttrAndRange(bool forTargetVariant = false) const;
 
-  /// Returns true if the decl has an active `@backDeployed` attribute for the
-  /// given context.
-  bool isBackDeployed(ASTContext &Ctx) const;
+  /// Returns true if the decl has a valid and active `@backDeployed` attribute.
+  bool isBackDeployed() const;
 
   /// Returns the starting location of the entire declaration.
   SourceLoc getStartLoc() const { return getSourceRange().Start; }
@@ -1464,6 +1499,27 @@ public:
   std::optional<SemanticAvailableAttr>
   getAvailableAttrForPlatformIntroduction(bool checkExtension = true) const;
 
+  /// Returns true if `decl` has any active `@available` attribute attached to
+  /// it.
+  bool hasAnyActiveAvailableAttr() const {
+    return hasAnyMatchingActiveAvailableAttr(
+        [](SemanticAvailableAttr attr) -> bool { return true; });
+  }
+
+  /// Returns true if `predicate` returns true for any active availability
+  /// attribute attached to `decl`. The predicate function should accept a
+  /// `SemanticAvailableAttr`.
+  template <typename F>
+  bool hasAnyMatchingActiveAvailableAttr(F predicate) const {
+    auto &ctx = getASTContext();
+    auto decl = getAbstractSyntaxDeclForAttributes();
+    for (auto attr : decl->getSemanticAvailableAttrs()) {
+      if (attr.isActive(ctx) && predicate(attr))
+        return true;
+    }
+    return false;
+  }
+
   /// Returns true if the declaration is deprecated at the current deployment
   /// target.
   bool isDeprecated() const { return getDeprecatedAttr().has_value(); }
@@ -1520,6 +1576,10 @@ public:
   /// stubs if the compiler flags have enabled unavailable declaration ABI
   /// compatibility mode.
   bool requiresUnavailableDeclABICompatibilityStubs() const;
+
+  /// Returns the decl that should be considered the parent decl when looking
+  /// for inherited availability annotations.
+  const Decl *parentDeclForAvailability() const;
 
   // List the SPI groups declared with @_spi or inherited by this decl.
   //
@@ -1641,15 +1701,15 @@ public:
   ///
   /// \code
   /// class C<T> {
-  ///   func f1() {}    // isGeneric == false
-  ///   func f2<T>() {} // isGeneric == true
+  ///   func f1() {}    // hasGenericParamList == false
+  ///   func f2<T>() {} // hasGenericParamList == true
   /// }
   ///
-  /// protocol P { // isGeneric == true due to implicit Self param
-  ///   func p()   // isGeneric == false
+  /// protocol P { // hasGenericParamList == true due to implicit Self param
+  ///   func p()   // hasGenericParamList == false
   /// }
   /// \endcode
-  bool isGeneric() const { return getGenericParams() != nullptr; }
+  bool hasGenericParamList() const { return getGenericParams() != nullptr; }
   bool hasComputedGenericSignature() const;
   bool isComputingGenericSignature() const;
   
@@ -1739,8 +1799,8 @@ public:
   ///          path will include 'Foo'. This return value is always owned by \c ImportDecl
   ///          (which is owned by the AST context), so it can be persisted.
   ImportPath getImportPath() const {
-    return ImportPath({ getTrailingObjects<ImportPath::Element>(),
-                        static_cast<size_t>(Bits.ImportDecl.NumPathElements) });
+    return ImportPath(getTrailingObjects(
+        static_cast<size_t>(Bits.ImportDecl.NumPathElements)));
   }
 
   /// Retrieves the import path, replacing any module aliases with real names.
@@ -1932,6 +1992,12 @@ public:
   Type getResolvedType(unsigned i, TypeResolutionStage stage =
                                        TypeResolutionStage::Interface) const;
 
+  /// If the given index corresponds to a "suppressed" entry, returns the
+  /// information associated with it, and `std::nullopt` otherwise.
+  std::optional<std::pair<Type, InverseTypeRepr *>> getAsSuppressed(
+      unsigned i,
+      TypeResolutionStage stage = TypeResolutionStage::Interface) const;
+
   /// Returns the underlying array of inherited type entries.
   ///
   /// NOTE: The `Type` associated with an entry may not be resolved yet.
@@ -2017,6 +2083,7 @@ class ExtensionDecl final : public GenericContext, public Decl,
   std::pair<LazyMemberLoader *, uint64_t> takeConformanceLoaderSlow();
 
   friend class ExtendedNominalRequest;
+  friend class BindExtensionsRequest;
   friend class Decl;
 public:
   using Decl::getASTContext;
@@ -2054,13 +2121,14 @@ public:
   Type getExtendedType() const;
 
   /// Retrieve the nominal type declaration that is being extended.
-  /// Will  trip an assertion if the declaration has not already been computed.
+  /// Will trip an assertion if the declaration has not already been computed.
   /// In order to fail fast when type checking work is attempted
   /// before extension binding has taken place.
-
   NominalTypeDecl *getExtendedNominal() const;
 
-  /// Compute the nominal type declaration that is being extended.
+  /// Compute the nominal type declaration that is being extended. The result
+  /// is not cached, this should only be invoked by extension binding itself.
+  /// FIXME: Make this private once lldb has been migrated off it.
   NominalTypeDecl *computeExtendedNominal(
       bool excludeMacroExpansions=false) const;
 
@@ -2542,9 +2610,7 @@ public:
                                                Pattern *Pat, Expr *E,
                                                DeclContext *Parent);
 
-  SourceLoc getStartLoc() const {
-    return StaticLoc.isValid() ? StaticLoc : VarLoc;
-  }
+  SourceLoc getStartLoc() const;
   SourceRange getSourceRange() const;
 
   unsigned getNumPatternEntries() const {
@@ -2786,7 +2852,7 @@ public:
 private:
   MutableArrayRef<PatternBindingEntry> getMutablePatternList() {
     // Pattern entries are tail allocated.
-    return {getTrailingObjects<PatternBindingEntry>(), getNumPatternEntries()};
+    return getTrailingObjects(getNumPatternEntries());
   }
 };
   
@@ -2886,6 +2952,10 @@ private:
     /// a null pointer.
     unsigned noOpaqueResultType : 1;
 
+    /// Whether the ClangUSRGenerationRequest request was evaluated and produced
+    /// a std::nullopt.
+    unsigned noClangUSR : 1;
+
     /// Whether the "isFinal" bit has been computed yet.
     unsigned isFinalComputed : 1;
 
@@ -2902,6 +2972,10 @@ private:
 
     /// Whether we've evaluated the ApplyAccessNoteRequest.
     unsigned accessNoteApplied : 1;
+
+    /// Whether the AvailabilityDomainForDeclRequest request was evaluated and
+    /// yielded no availability domain.
+    unsigned noAvailabilityDomain : 1;
   } LazySemanticInfo = { };
 
   friend class DynamicallyReplacedDeclRequest;
@@ -2915,6 +2989,8 @@ private:
   friend class ActorIsolationRequest;
   friend class OpaqueResultTypeRequest;
   friend class ApplyAccessNoteRequest;
+  friend class AvailabilityDomainForDeclRequest;
+  friend class ClangUSRGenerationRequest;
 
   friend class Decl;
   SourceLoc getLocFromSource() const { return NameLoc; }
@@ -3001,6 +3077,12 @@ public:
   /// `distributed var get { }` accessors.
   bool isDistributedGetAccessor() const;
 
+  /// Whether this is the special synthesized 'id' or 'actorSystem' property
+  /// of a distributed actor. If \p onlyCheckName is set, then any
+  /// matching user-defined property with the name is also considered.
+  std::optional<SpecialDistributedActorProperty>
+  isSpecialDistributedActorProperty(bool onlyCheckName = false) const;
+
   bool hasName() const { return bool(Name); }
   bool isOperator() const { return Name.isOperator(); }
 
@@ -3016,11 +3098,10 @@ public:
     return Name.getBaseIdentifier();
   }
 
-  /// Generates a DeclNameRef referring to this declaration with as much
-  /// specificity as possible.
-  DeclNameRef createNameRef() const {
-    return DeclNameRef(Name);
-  }
+  /// Generates a DeclNameRef referring to this declaration.
+  ///
+  /// \param moduleSelector If true, the name ref includes the module name.
+  DeclNameRef createNameRef(bool moduleSelector = false) const;
 
   /// Retrieve the C declaration name that names this function, or empty
   /// string if it has none.
@@ -3045,6 +3126,10 @@ public:
   /// Returns \c true if this value decl is inlinable with attributes
   /// \c \@usableFromInline, \c \@inlinalbe, and \c \@_alwaysEmitIntoClient
   bool isUsableFromInline() const;
+
+  // Returns \c true if this value decl is marked with an attribute that implies
+  // \c \@inlinable semantics: either \c \@inlinable or \c \@inline(always)
+  bool hasAttributeWithInlinableSemantics() const;
 
   /// Returns \c true if this declaration is *not* intended to be used directly
   /// by application developers despite the visibility.
@@ -3566,7 +3651,8 @@ private:
   OpaqueTypeDecl(ValueDecl *NamingDecl, GenericParamList *GenericParams,
                  DeclContext *DC,
                  GenericSignature OpaqueInterfaceGenericSignature,
-                 ArrayRef<TypeRepr *> OpaqueReturnTypeReprs);
+                 ArrayRef<TypeRepr *> OpaqueReturnTypeReprs,
+                 bool hasLazyUnderlyingSubstitutions);
 
   unsigned getNumOpaqueReturnTypeReprs() const {
     return NamingDeclAndHasOpaqueReturnTypeRepr.getInt()
@@ -3578,12 +3664,20 @@ private:
     return getNumOpaqueReturnTypeReprs();
   }
 
+  void loadLazyUnderlyingSubstitutions();
+
 public:
-  static OpaqueTypeDecl *get(
+  static OpaqueTypeDecl *create(
       ValueDecl *NamingDecl, GenericParamList *GenericParams,
       DeclContext *DC,
       GenericSignature OpaqueInterfaceGenericSignature,
       ArrayRef<TypeRepr *> OpaqueReturnTypeReprs);
+
+  static OpaqueTypeDecl *createDeserialized(
+      GenericParamList *GenericParams,
+      DeclContext *DC,
+      GenericSignature OpaqueInterfaceGenericSignature,
+      LazyMemberLoader *lazyLoader, uint64_t underlyingSubsData);
 
   ValueDecl *getNamingDecl() const {
     return NamingDeclAndHasOpaqueReturnTypeRepr.getPointer();
@@ -3628,10 +3722,7 @@ public:
   /// Retrieve the buffer containing the opaque return type
   /// representations that correspond to the opaque generic parameters.
   ArrayRef<TypeRepr *> getOpaqueReturnTypeReprs() const {
-    return {
-      getTrailingObjects<TypeRepr *>(),
-      getNumOpaqueReturnTypeReprs()
-    };
+    return getTrailingObjects(getNumOpaqueReturnTypeReprs());
   }
 
   /// Should the underlying type be visible to clients outside of the module?
@@ -3639,22 +3730,23 @@ public:
 
   /// The substitutions that map the generic parameters of the opaque type to
   /// the unique underlying types, when that information is known.
-  std::optional<SubstitutionMap> getUniqueUnderlyingTypeSubstitutions() const;
+  std::optional<SubstitutionMap> getUniqueUnderlyingTypeSubstitutions(
+      bool typeCheckFunctionBodies=true) const;
 
   void setUniqueUnderlyingTypeSubstitutions(SubstitutionMap subs) {
-    assert(!UniqueUnderlyingType.has_value() && "resetting underlying type?!");
+    ASSERT(!Bits.OpaqueTypeDecl.HasLazyUnderlyingSubstitutions);
+    ASSERT(!UniqueUnderlyingType.has_value() && "resetting underlying type?!");
     UniqueUnderlyingType = subs;
   }
 
   bool hasConditionallyAvailableSubstitutions() const {
+    const_cast<OpaqueTypeDecl *>(this)->loadLazyUnderlyingSubstitutions();
+
     return ConditionallyAvailableTypes.has_value();
   }
 
   ArrayRef<ConditionallyAvailableSubstitutions *>
-  getConditionallyAvailableSubstitutions() const {
-    assert(ConditionallyAvailableTypes);
-    return ConditionallyAvailableTypes.value();
-  }
+  getConditionallyAvailableSubstitutions() const;
 
   void setConditionallyAvailableSubstitutions(
       ArrayRef<ConditionallyAvailableSubstitutions *> substitutions);
@@ -3678,40 +3770,36 @@ public:
     return false;
   }
 
-  using AvailabilityCondition = std::pair<VersionRange, bool>;
-
   class ConditionallyAvailableSubstitutions final
-      : private llvm::TrailingObjects<
-            ConditionallyAvailableSubstitutions,
-            AvailabilityCondition> {
+      : private llvm::TrailingObjects<ConditionallyAvailableSubstitutions,
+                                      AvailabilityQuery> {
     friend TrailingObjects;
 
-    unsigned NumAvailabilityConditions;
+    unsigned NumAvailabilityQueries;
 
     SubstitutionMap Substitutions;
 
     /// A type with limited availability described by the provided set
     /// of availability conditions (with `and` relationship).
     ConditionallyAvailableSubstitutions(
-        ArrayRef<AvailabilityCondition> availabilityContext,
+        ArrayRef<AvailabilityQuery> availabilityQueries,
         SubstitutionMap substitutions)
-        : NumAvailabilityConditions(availabilityContext.size()),
+        : NumAvailabilityQueries(availabilityQueries.size()),
           Substitutions(substitutions) {
-      assert(!availabilityContext.empty());
-      std::uninitialized_copy(availabilityContext.begin(),
-                              availabilityContext.end(),
-                              getTrailingObjects<AvailabilityCondition>());
+      assert(!availabilityQueries.empty());
+      std::uninitialized_copy(availabilityQueries.begin(),
+                              availabilityQueries.end(), getTrailingObjects());
     }
 
   public:
-    ArrayRef<AvailabilityCondition> getAvailability() const {
-      return {getTrailingObjects<AvailabilityCondition>(), NumAvailabilityConditions};
+    ArrayRef<AvailabilityQuery> getAvailabilityQueries() const {
+      return getTrailingObjects(NumAvailabilityQueries);
     }
 
     SubstitutionMap getSubstitutions() const { return Substitutions; }
 
     static ConditionallyAvailableSubstitutions *
-    get(ASTContext &ctx, ArrayRef<AvailabilityCondition> availabilityContext,
+    get(ASTContext &ctx, ArrayRef<AvailabilityQuery> availabilityContext,
         SubstitutionMap substitutions);
   };
 };
@@ -4857,6 +4945,16 @@ public:
     return getAttrs().hasAttribute<IndirectAttr>();
   }
 
+  /// True if the enum is marked with `@c`.
+  bool isCDeclEnum() const {
+    return getAttrs().hasAttribute<CDeclAttr>();
+  }
+
+  /// True if the enum is marked with `@c` or `@objc`.
+  bool isCCompatibleEnum() const {
+    return isCDeclEnum() || isObjC();
+  }
+
   /// True if the enum can be exhaustively switched within \p useDC.
   ///
   /// Note that this property is \e not necessarily true for all children of
@@ -5368,7 +5466,6 @@ enum class KnownDerivableProtocolKind : uint8_t {
   Decodable,
   AdditiveArithmetic,
   Differentiable,
-  Identifiable,
   Actor,
   DistributedActor,
   DistributedActorSystem,
@@ -5889,7 +5986,7 @@ private:
     inline AccessorDecl *getAccessor(AccessorKind kind) const;
 
     ArrayRef<AccessorDecl *> getAllAccessors() const {
-      return { getTrailingObjects<AccessorDecl*>(), NumAccessors };
+      return getTrailingObjects(NumAccessors);
     }
 
     void addOpaqueAccessor(AccessorDecl *accessor);
@@ -5898,7 +5995,7 @@ private:
 
   private:
     MutableArrayRef<AccessorDecl *> getAccessorsBuffer() {
-      return { getTrailingObjects<AccessorDecl*>(), NumAccessors };
+      return getTrailingObjects(NumAccessors);
     }
 
     bool registerAccessor(AccessorDecl *accessor, AccessorIndex index);
@@ -5998,9 +6095,7 @@ public:
 
   /// Return true if this is a property that either has storage
   /// or init accessor associated with it.
-  bool supportsInitialization() const {
-    return hasStorage() || hasInitAccessor();
-  }
+  bool supportsInitialization() const;
 
   /// Return true if this storage has the basic accessors/capability
   /// to be mutated.  This is generally constant after the accessors are
@@ -6201,7 +6296,7 @@ public:
   bool requiresOpaqueRead2Coroutine() const;
 
   /// Does this storage require a 'set' accessor in its opaque-accessors set?
-  bool requiresOpaqueSetter() const { return supportsMutation(); }
+  bool requiresOpaqueSetter() const;
 
   /// Does this storage require a '_modify' accessor in its opaque-accessors
   /// set?
@@ -6654,7 +6749,10 @@ public:
   ///
   /// From the standpoint of access control and exportability checking, this
   /// var will behave as if it was public, even if it is internal or private.
-  bool isLayoutExposedToClients() const;
+  ///
+  /// If \p applyImplicit, consider implicitly exposed layouts as well.
+  /// This applies to non-resilient modules.
+  bool isLayoutExposedToClients(bool applyImplicit = false) const;
 
   /// Is this a special debugger variable?
   bool isDebuggerVar() const { return Bits.VarDecl.IsDebuggerVar; }
@@ -6662,13 +6760,18 @@ public:
     Bits.VarDecl.IsDebuggerVar = IsDebuggerVar;
   }
 
-  /// Visit all auxiliary declarations to this VarDecl.
+  /// Visit all auxiliary variables for this VarDecl.
   ///
-  /// An auxiliary declaration is a declaration synthesized by the compiler to support
-  /// this VarDecl, such as synthesized property wrapper variables.
+  /// An auxiliary variable is one that is synthesized by the compiler to
+  /// support this VarDecl, such as synthesized property wrapper variables.
   ///
-  /// \note this function only visits auxiliary decls that are not part of the AST.
-  void visitAuxiliaryDecls(llvm::function_ref<void(VarDecl *)>) const;
+  /// \param forNameLookup If \c true, will only visit auxiliary variables that
+  /// may appear in name lookup results.
+  ///
+  /// \note this function only visits auxiliary variables that are not part of
+  /// the AST.
+  void visitAuxiliaryVars(bool forNameLookup,
+                          llvm::function_ref<void(VarDecl *)>) const;
 
   /// Is this the synthesized storage for a 'lazy' property?
   bool isLazyStorageProperty() const {
@@ -6942,9 +7045,6 @@ class ParamDecl : public VarDecl {
 
     /// Whether or not this parameter is 'sending'.
     IsSending = 1 << 4,
-
-    /// Whether or not this parameter is isolated to a caller.
-    IsCallerIsolated = 1 << 5,
   };
 
   /// The type repr and 3 bits used for flags.
@@ -7044,6 +7144,14 @@ public:
       Identifier argumentName, SourceLoc parameterNameLoc,
       Identifier parameterName, Expr *defaultValue,
       DefaultArgumentInitializer *defaultValueInitContext, DeclContext *dc);
+
+  SourceLoc getLocFromSource() const {
+    // If we have a name loc, use it, otherwise fallback to the start loc for
+    // e.g enum elements without parameter names.
+    if (auto nameLoc = getNameLoc())
+      return nameLoc;
+    return getStartLoc();
+  }
 
   /// Retrieve the argument (API) name for this function parameter.
   Identifier getArgumentName() const {
@@ -7235,18 +7343,6 @@ public:
       addFlag(Flag::IsSending);
     else
       removeFlag(Flag::IsSending);
-  }
-
-  /// Whether or not this parameter is marked with 'nonisolated(nonsending)'.
-  bool isCallerIsolated() const {
-    return getOptions().contains(Flag::IsCallerIsolated);
-  }
-
-  void setCallerIsolated(bool value = true) {
-    if (value)
-      addFlag(Flag::IsCallerIsolated);
-    else
-      removeFlag(Flag::IsCallerIsolated);
   }
 
   /// Whether or not this parameter is marked with '@_addressable'.
@@ -8048,15 +8144,6 @@ public:
            getSILSynthesizeKind() == SILSynthesizeKind::DistributedActorFactory;
   }
 
-  /// Return a vector of distributed requirements that this distributed method
-  /// is implementing.
-  ///
-  /// If the method is witness to multiple requirements this is incorrect and
-  /// should be diagnosed during type-checking as it may make remoteCalls
-  /// ambiguous.
-  llvm::ArrayRef<ValueDecl *>
-  getDistributedMethodWitnessedProtocolRequirements() const;
-
   /// Determines whether this function is a 'remoteCall' function,
   /// which is used as ad-hoc protocol requirement by the
   /// 'DistributedActorSystem' protocol.
@@ -8172,6 +8259,11 @@ public:
   /// instance method.
   bool isObjCInstanceMethod() const;
 
+  /// Get the foreign language targeted by a @c-style attribute, if any.
+  /// Used to abstract away the change in meaning of @c vs @_cdecl while
+  /// formalizing the attribute.
+  std::optional<ForeignLanguage> getCDeclKind() const;
+
   /// Determine whether the name of an argument is an API name by default
   /// depending on the function context.
   bool argumentNameIsAPIByDefault() const;
@@ -8261,10 +8353,6 @@ public:
   /// Get the type of this declaration without the Self clause.
   /// Asserts if not in type context.
   Type getMethodInterfaceType() const;
-
-  /// Tests if this is a function returning a DynamicSelfType, or a
-  /// constructor.
-  bool hasDynamicSelfResult() const;
 
   /// The async function marked as the alternative to this function, if any.
   AbstractFunctionDecl *getAsyncAlternative() const;
@@ -8437,9 +8525,8 @@ public:
   SourceLoc getStaticLoc() const { return StaticLoc; }
   SourceLoc getFuncLoc() const { return FuncLoc; }
 
-  SourceLoc getStartLoc() const {
-    return StaticLoc.isValid() ? StaticLoc : FuncLoc;
-  }
+  SourceLoc getStartLoc() const;
+  SourceLoc getEndLoc() const;
   SourceRange getSourceRange() const;
 
   TypeRepr *getResultTypeRepr() const { return FnRetType.getTypeRepr(); }
@@ -8633,7 +8720,7 @@ public:
     switch (getAccessorKind()) {
 #define OBSERVING_ACCESSOR(ID, KEYWORD) \
     case AccessorKind::ID: return true;
-#define ACCESSOR(ID) \
+#define ACCESSOR(ID, KEYWORD)                                                  \
     case AccessorKind::ID: return false;
 #include "swift/AST/AccessorKinds.def"
     }
@@ -8656,7 +8743,7 @@ public:
     switch (getAccessorKind()) {
 #define COROUTINE_ACCESSOR(ID, KEYWORD) \
     case AccessorKind::ID: return true;
-#define ACCESSOR(ID) \
+#define ACCESSOR(ID, KEYWORD)                                                  \
     case AccessorKind::ID: return false;
 #include "swift/AST/AccessorKinds.def"
     }
@@ -8671,6 +8758,13 @@ public:
   /// use the implicit oldValue parameter in its body or does not have
   /// an explicit parameter in its parameter list.
   bool isSimpleDidSet() const;
+
+  bool isBorrowAccessor() const {
+    return getAccessorKind() == AccessorKind::Borrow;
+  }
+  bool isMutateAccessor() const {
+    return getAccessorKind() == AccessorKind::Mutate;
+  }
 
   void setIsTransparent(bool transparent) {
     Bits.AccessorDecl.IsTransparent = transparent;
@@ -8736,7 +8830,7 @@ class EnumCaseDecl final : public Decl,
   {
     Bits.EnumCaseDecl.NumElements = Elements.size();
     std::uninitialized_copy(Elements.begin(), Elements.end(),
-                            getTrailingObjects<EnumElementDecl *>());
+                            getTrailingObjects());
   }
   SourceLoc getLocFromSource() const { return CaseLoc; }
 
@@ -8747,8 +8841,8 @@ public:
   
   /// Get the list of elements declared in this case.
   ArrayRef<EnumElementDecl *> getElements() const {
-    return {getTrailingObjects<EnumElementDecl *>(),
-            static_cast<size_t>(Bits.EnumCaseDecl.NumElements)};
+    return getTrailingObjects(
+        static_cast<size_t>(Bits.EnumCaseDecl.NumElements));
   }
   SourceRange getSourceRange() const;
 

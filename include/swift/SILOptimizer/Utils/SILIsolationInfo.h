@@ -53,10 +53,16 @@ public:
     /// function)... so we just use an artificial ActorInstance to represent
     /// self in this case.
     CapturedActorSelf = 0x2,
+
+    /// An actor instance in an async allocating init where we are going to
+    /// allocate the actual actor internally. This is considered to be isolated
+    /// to the actor instance.
+    ActorAsyncAllocatingInit = 0x3,
   };
 
-  /// Set to (SILValue(), $KIND) if we have an ActorAccessorInit|CapturedSelf.
-  /// Is null if we have (SILValue(), Kind::Value).
+  /// Set to (SILValue(), $KIND) if we have an
+  /// ActorAccessorInit|CapturedSelf|ActorAsyncAllocatingInit.  Is null if we
+  /// have (SILValue(), Kind::Value).
   llvm::PointerIntPair<SILValue, 2> value;
 
   ActorInstance(SILValue value, Kind kind)
@@ -94,6 +100,12 @@ public:
     return ActorInstance(SILValue(), Kind::CapturedActorSelf);
   }
 
+  /// See Kind::ActorAsyncAllocatingInit for explanation on what a
+  /// ActorAsyncAllocatingInit is.
+  static ActorInstance getForActorAsyncAllocatingInit() {
+    return ActorInstance(SILValue(), Kind::ActorAsyncAllocatingInit);
+  }
+
   explicit operator bool() const { return bool(value.getOpaqueValue()); }
 
   Kind getKind() const { return Kind(value.getInt()); }
@@ -117,6 +129,10 @@ public:
     return getKind() == Kind::CapturedActorSelf;
   }
 
+  bool isActorAsyncAllocatingInit() const {
+    return getKind() == Kind::ActorAsyncAllocatingInit;
+  }
+
   bool operator==(const ActorInstance &other) const {
     // If both are null, return true.
     if (!bool(*this) && !bool(other))
@@ -132,6 +148,7 @@ public:
       return getValue() == other.getValue();
     case Kind::ActorAccessorInit:
     case Kind::CapturedActorSelf:
+    case Kind::ActorAsyncAllocatingInit:
       return true;
     }
   }
@@ -301,6 +318,25 @@ public:
     return self;
   }
 
+  bool isNonisolatedNonsendingTaskIsolated() const {
+    return getOptions().contains(Flag::NonisolatedNonsendingTaskIsolated);
+  }
+
+  SILIsolationInfo
+  withNonisolatedNonsendingTaskIsolated(bool newValue = true) const {
+    assert(*this && "Cannot be unknown");
+    assert(isTaskIsolated() && "Can only be task isolated");
+    auto self = *this;
+    if (newValue) {
+      self.options =
+          (self.getOptions() | Flag::NonisolatedNonsendingTaskIsolated).toRaw();
+    } else {
+      self.options = self.getOptions().toRaw() &
+                     ~Options(Flag::NonisolatedNonsendingTaskIsolated).toRaw();
+    }
+    return self;
+  }
+
   /// Produce a new isolation info value that merges in the given isolated
   /// conformance value.
   ///
@@ -319,25 +355,6 @@ public:
         ? isolatedConformance
         : newIsolatedConformance;
     return result;
-  }
-
-  bool isNonisolatedNonsendingTaskIsolated() const {
-    return getOptions().contains(Flag::NonisolatedNonsendingTaskIsolated);
-  }
-
-  SILIsolationInfo
-  withNonisolatedNonsendingTaskIsolated(bool newValue = true) const {
-    assert(*this && "Cannot be unknown");
-    assert(isTaskIsolated() && "Can only be task isolated");
-    auto self = *this;
-    if (newValue) {
-      self.options =
-          (self.getOptions() | Flag::NonisolatedNonsendingTaskIsolated).toRaw();
-    } else {
-      self.options = self.getOptions().toRaw() &
-                     ~Options(Flag::NonisolatedNonsendingTaskIsolated).toRaw();
-    }
-    return self;
   }
 
   /// Returns true if this actor isolation is derived from an unapplied
@@ -546,6 +563,12 @@ public:
   /// Infer isolation of conformances for the given instruction.
   static SILIsolationInfo getConformanceIsolation(SILInstruction *inst);
 
+  /// Return SILIsolationInfo based off of the attached ActorIsolation of \p
+  /// fn. If \p fn does not have an actor isolation set, returns an invalid
+  /// SILIsolationInfo.
+  static SILIsolationInfo getFunctionIsolation(SILFunction *fn);
+
+private:
   /// A helper that is used to ensure that we treat certain builtin values as
   /// non-Sendable that the AST level otherwise thinks are non-Sendable.
   ///
@@ -558,12 +581,20 @@ public:
     return !isNonSendableType(type, fn);
   }
 
-  static bool isNonSendableType(SILValue value) {
-    return isNonSendableType(value->getType(), value->getFunction());
+public:
+  static bool isSendable(SILValue value);
+
+  static bool isNonSendable(SILValue value) { return !isSendable(value); }
+
+  static bool boxContainsOnlySendableFields(AllocBoxInst *abi) {
+    return boxTypeContainsOnlySendableFields(abi->getBoxType(),
+                                             abi->getFunction());
   }
 
-  static bool isSendableType(SILValue value) {
-    return !isNonSendableType(value);
+  static bool boxTypeContainsOnlySendableFields(CanSILBoxType boxType,
+                                                SILFunction *fn) {
+    return llvm::all_of(boxType->getSILFieldTypes(*fn),
+                        [&](SILType type) { return isSendableType(type, fn); });
   }
 
   bool hasSameIsolation(ActorIsolation actorIsolation) const;
@@ -572,7 +603,7 @@ public:
   /// for the isolated values if any to not match.
   ///
   /// This is useful if one has two non-Sendable values projected from the same
-  /// actor or global actor isolated value. E.x.: two different ref_element_addr
+  /// actor or global-actor-isolated value. E.x.: two different ref_element_addr
   /// from the same actor.
   bool hasSameIsolation(const SILIsolationInfo &other) const;
 

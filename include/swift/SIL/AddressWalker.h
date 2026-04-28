@@ -185,6 +185,7 @@ TransitiveAddressWalker<Impl>::walk(SILValue projectedAddress) {
         llvm_unreachable("Never takes an address");
       // Point uses.
       case TermKind::ReturnInst:
+      case TermKind::ReturnBorrowInst:
       case TermKind::ThrowInst:
       case TermKind::YieldInst:
       case TermKind::TryApplyInst:
@@ -214,8 +215,7 @@ TransitiveAddressWalker<Impl>::walk(SILValue projectedAddress) {
         isa<AssignInst>(user) || isa<LoadUnownedInst>(user) ||
         isa<StoreUnownedInst>(user) || isa<EndApplyInst>(user) ||
         isa<LoadWeakInst>(user) || isa<StoreWeakInst>(user) ||
-        isa<AssignByWrapperInst>(user) || isa<AssignOrInitInst>(user) ||
-        isa<BeginUnpairedAccessInst>(user) ||
+        isa<AssignOrInitInst>(user) || isa<BeginUnpairedAccessInst>(user) ||
         isa<EndUnpairedAccessInst>(user) || isa<WitnessMethodInst>(user) ||
         isa<SelectEnumAddrInst>(user) || isa<InjectEnumAddrInst>(user) ||
         isa<IsUniqueInst>(user) || isa<ValueMetatypeInst>(user) ||
@@ -229,7 +229,8 @@ TransitiveAddressWalker<Impl>::walk(SILValue projectedAddress) {
         isa<PackElementSetInst>(user) || isa<PackElementGetInst>(user) ||
         isa<DeinitExistentialAddrInst>(user) || isa<LoadBorrowInst>(user) ||
         isa<TupleAddrConstructorInst>(user) || isa<DeallocPackInst>(user) ||
-        isa<MergeIsolationRegionInst>(user) || isa<EndCOWMutationAddrInst>(user)) {
+        isa<MergeIsolationRegionInst>(user) ||
+        isa<EndCOWMutationAddrInst>(user)) {
       callVisitUse(op);
       continue;
     }
@@ -249,6 +250,7 @@ TransitiveAddressWalker<Impl>::walk(SILValue projectedAddress) {
         isa<BeginAccessInst>(user) || isa<TailAddrInst>(user) ||
         isa<IndexAddrInst>(user) || isa<StoreBorrowInst>(user) ||
         isa<UncheckedAddrCastInst>(user) ||
+        isa<VectorBaseAddrInst>(user) ||
         isa<MarkUnresolvedNonCopyableValueInst>(user) ||
         isa<MarkUninitializedInst>(user) || isa<DropDeinitInst>(user) ||
         isa<ProjectBlockStorageInst>(user) || isa<UpcastInst>(user) ||
@@ -287,11 +289,14 @@ TransitiveAddressWalker<Impl>::walk(SILValue projectedAddress) {
         case BuiltinValueKind::GenericXor:
         case BuiltinValueKind::TaskRunInline:
         case BuiltinValueKind::ZeroInitializer:
+        case BuiltinValueKind::PrepareInitialization:
         case BuiltinValueKind::GetEnumTag:
         case BuiltinValueKind::InjectEnumTag:
         case BuiltinValueKind::AddressOfRawLayout:
         case BuiltinValueKind::FlowSensitiveSelfIsolation:
         case BuiltinValueKind::FlowSensitiveDistributedSelfIsolation:
+        case BuiltinValueKind::TaskLocalValuePush:
+        case BuiltinValueKind::AddTaskLocalValue:
           callVisitUse(op);
           continue;
         default:

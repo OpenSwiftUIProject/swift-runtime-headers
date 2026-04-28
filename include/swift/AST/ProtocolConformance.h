@@ -148,7 +148,7 @@ protected:
       Kind : bitmax(NumProtocolConformanceKindBits, 8),
 
       /// Whether the "raw" conformance isolation is "inferred", which applies to most conformances.
-      IsRawConformanceInferred : 1,
+      IsRawIsolationInferred : 1,
 
       /// Whether the computed actor isolation is nonisolated.
       IsComputedNonisolated : 1
@@ -205,16 +205,16 @@ protected:
   ProtocolConformance(ProtocolConformanceKind kind, Type conformingType)
     : ConformingType(conformingType) {
     Bits.ProtocolConformance.Kind = unsigned(kind);
-    Bits.ProtocolConformance.IsRawConformanceInferred = false;
+    Bits.ProtocolConformance.IsRawIsolationInferred = false;
     Bits.ProtocolConformance.IsComputedNonisolated = false;
   }
 
-  bool isRawConformanceInferred() const {
-    return Bits.ProtocolConformance.IsRawConformanceInferred;
+  bool isRawIsolationInferred() const {
+    return Bits.ProtocolConformance.IsRawIsolationInferred;
   }
 
   void setRawConformanceInferred(bool value = true) {
-    Bits.ProtocolConformance.IsRawConformanceInferred = value;
+    Bits.ProtocolConformance.IsRawIsolationInferred = value;
   }
 
   bool isComputedNonisolated() const {
@@ -395,10 +395,6 @@ public:
 
   /// Retrieve the protocol conformance for the inherited protocol.
   ProtocolConformance *getInheritedConformance(ProtocolDecl *protocol) const;
-
-  /// Given a dependent type expressed in terms of the self parameter,
-  /// map it into the context of this conformance.
-  Type getAssociatedType(Type assocType) const;
 
   /// Given that the requirement signature of the protocol directly states
   /// that the given dependent type must conform to the given protocol,
@@ -972,9 +968,7 @@ public:
   }
 
   ProtocolConformanceRef getAssociatedConformance(Type assocType,
-                                                  ProtocolDecl *protocol) const{
-    llvm_unreachable("self-conformances never have associated types");
-  }
+                                                  ProtocolDecl *protocol) const;
 
   bool hasWitness(ValueDecl *requirement) const {
     return true;

@@ -141,17 +141,7 @@ public:
     return getName().str() == "immortal";
   }
 
-  std::string getString() const {
-    switch (kind) {
-    case DescriptorKind::Named:
-      return getName().str().str();
-    case DescriptorKind::Ordered:
-      return std::to_string(getIndex());
-    case DescriptorKind::Self:
-      return "self";
-    }
-    llvm_unreachable("Invalid DescriptorKind");
-  }
+  std::string getString() const;
 };
 
 class LifetimeEntry final
@@ -170,7 +160,7 @@ private:
       : startLoc(startLoc), endLoc(endLoc), numSources(sources.size()),
         targetDescriptor(targetDescriptor) {
     std::uninitialized_copy(sources.begin(), sources.end(),
-                            getTrailingObjects<LifetimeDescriptor>());
+                            getTrailingObjects());
   }
 
   size_t numTrailingObjects(OverloadToken<LifetimeDescriptor>) const {
@@ -189,7 +179,7 @@ public:
   SourceLoc getEndLoc() const { return endLoc; }
 
   ArrayRef<LifetimeDescriptor> getSources() const {
-    return {getTrailingObjects<LifetimeDescriptor>(), numSources};
+    return getTrailingObjects(numSources);
   }
 
   std::optional<LifetimeDescriptor> getTargetDescriptor() const {
@@ -218,15 +208,11 @@ public:
         addressableParamIndicesAndImmortal(addressableParamIndices, isImmortal),
         conditionallyAddressableParamIndices(conditionallyAddressableParamIndices),
         targetIndex(targetIndex) {
-    assert(this->isImmortal() || inheritLifetimeParamIndices ||
+    ASSERT(this->isImmortal() || inheritLifetimeParamIndices ||
            scopeLifetimeParamIndices);
-    // FIXME: This assert can trigger when Optional/Result support ~Escapable use (rdar://147765187)
-    // assert(!inheritLifetimeParamIndices ||
-    //        !inheritLifetimeParamIndices->isEmpty());
-    if (inheritLifetimeParamIndices && inheritLifetimeParamIndices->isEmpty()) {
-      inheritLifetimeParamIndices = nullptr;
-    }
-    assert(!scopeLifetimeParamIndices || !scopeLifetimeParamIndices->isEmpty());
+    ASSERT(!inheritLifetimeParamIndices ||
+           !inheritLifetimeParamIndices->isEmpty());
+    ASSERT(!scopeLifetimeParamIndices || !scopeLifetimeParamIndices->isEmpty());
     assert((!addressableParamIndices
             || !conditionallyAddressableParamIndices
             || conditionallyAddressableParamIndices->isDisjointWith(
@@ -240,12 +226,12 @@ public:
         paramIndicesLength = inheritLifetimeParamIndices->getCapacity();
       }
       if (scopeLifetimeParamIndices) {
-        assert(paramIndicesLength == 0 ||
+        ASSERT(paramIndicesLength == 0 ||
                paramIndicesLength == scopeLifetimeParamIndices->getCapacity());
         paramIndicesLength = scopeLifetimeParamIndices->getCapacity();
       }
       if (addressableParamIndices) {
-        assert(paramIndicesLength == 0 ||
+        ASSERT(paramIndicesLength == 0 ||
                paramIndicesLength == addressableParamIndices->getCapacity());
         paramIndicesLength = addressableParamIndices->getCapacity();
       }

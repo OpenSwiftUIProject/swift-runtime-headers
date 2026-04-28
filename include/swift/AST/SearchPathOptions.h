@@ -45,7 +45,7 @@ enum class ModuleLoadingMode {
   PreferInterface,
   PreferSerialized,
   OnlyInterface,
-  OnlySerialized
+  OnlySerialized,
 };
 
 /// A single module search path that can come from different sources, e.g.
@@ -518,11 +518,8 @@ public:
   std::string ExplicitSwiftModuleMapPath;
 
   /// Module inputs specified with -swift-module-input,
-  /// <ModuleName, Path to .swiftmodule file>
+  /// ModuleName: Path to .swiftmodule file
   llvm::StringMap<std::string> ExplicitSwiftModuleInputs;
-
-  /// A map of placeholder Swift module dependency information.
-  std::string PlaceholderDependencyModuleMap;
 
   /// A file containing a list of protocols whose conformances require const value extraction.
   std::string ConstGatherProtocolListFilePath;

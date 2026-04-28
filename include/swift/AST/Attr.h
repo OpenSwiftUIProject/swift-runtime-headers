@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2025 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -16,7 +16,6 @@
 
 #ifndef SWIFT_ATTR_H
 #define SWIFT_ATTR_H
-
 #include "swift/AST/ASTAllocated.h"
 #include "swift/AST/AttrKind.h"
 #include "swift/AST/AutoDiff.h"
@@ -24,12 +23,13 @@
 #include "swift/AST/AvailabilityRange.h"
 #include "swift/AST/ConcreteDeclRef.h"
 #include "swift/AST/DeclNameLoc.h"
+#include "swift/AST/ExportKind.h"
 #include "swift/AST/Identifier.h"
 #include "swift/AST/KnownProtocols.h"
 #include "swift/AST/LifetimeDependence.h"
 #include "swift/AST/MacroDeclaration.h"
 #include "swift/AST/Ownership.h"
-#include "swift/AST/PlatformKind.h"
+#include "swift/AST/PlatformKindUtils.h"
 #include "swift/AST/StorageImpl.h"
 #include "swift/Basic/Debug.h"
 #include "swift/Basic/EnumTraits.h"
@@ -42,10 +42,10 @@
 #include "swift/Basic/SourceLoc.h"
 #include "swift/Basic/UUID.h"
 #include "swift/Basic/Version.h"
-#include "llvm/ADT/bit.h"
 #include "llvm/ADT/DenseMapInfo.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/bit.h"
 #include "llvm/ADT/iterator_range.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/TrailingObjects.h"
@@ -68,7 +68,9 @@ class CustomAttributeInitializer;
 class GenericFunctionType;
 class LazyConformanceLoader;
 class LazyMemberLoader;
+class MacroDecl;
 class ModuleDecl;
+class NominalTypeDecl;
 class PatternBindingInitializer;
 class TrailingWhereClause;
 class TypeExpr;
@@ -107,7 +109,46 @@ protected:
 class DeclAttributes;
 enum class DeclKind : uint8_t;
 
-  /// Represents one declaration attribute.
+enum : unsigned {
+  NumInlineKindBits =
+      countBitsUsed(static_cast<unsigned>(InlineKind::Last_InlineKind))
+};
+
+enum : unsigned {
+  NumEffectsKindBits =
+      countBitsUsed(static_cast<unsigned>(EffectsKind::Last_EffectsKind))
+};
+
+enum : unsigned {
+  NumExposureKindBits =
+      countBitsUsed(static_cast<unsigned>(ExposureKind::Last_ExposureKind))
+};
+
+enum : unsigned {
+  NumExternKindBits =
+      countBitsUsed(static_cast<unsigned>(ExternKind::Last_ExternKind))
+};
+
+enum : unsigned {
+  NumNonIsolatedModifierBits = countBitsUsed(
+      static_cast<unsigned>(NonIsolatedModifier::Last_NonIsolatedModifier))
+};
+
+enum : unsigned {
+  NumInheritActorContextKindBits = countBitsUsed(static_cast<unsigned>(
+      InheritActorContextModifier::Last_InheritActorContextKind))
+};
+
+enum : unsigned {
+  NumNonexhaustiveModeBits = countBitsUsed(
+      static_cast<unsigned>(NonexhaustiveMode::Last_NonexhaustiveMode))
+};
+
+enum : unsigned { NumDeclAttrKindBits = countBitsUsed(NumDeclAttrKinds - 1) };
+
+enum : unsigned { NumTypeAttrKindBits = countBitsUsed(NumTypeAttrKinds - 1) };
+
+/// Represents one declaration attribute.
 class DeclAttribute : public AttributeBase {
   friend class DeclAttributes;
 
@@ -203,7 +244,7 @@ protected:
       ownership : NumReferenceOwnershipBits
     );
 
-    SWIFT_INLINE_BITFIELD(SpecializeAttr, DeclAttribute, 1+1,
+    SWIFT_INLINE_BITFIELD(AbstractSpecializeAttr, DeclAttribute, 1+1,
       exported : 1,
       kind : 1
     );
@@ -216,8 +257,9 @@ protected:
       kind : NumExternKindBits
     );
 
-    SWIFT_INLINE_BITFIELD(SynthesizedProtocolAttr, DeclAttribute, 1,
-      isUnchecked : 1
+    SWIFT_INLINE_BITFIELD(SynthesizedProtocolAttr, DeclAttribute, 2,
+      isUnchecked : 1,
+      isSuppressed: 1
     );
 
     SWIFT_INLINE_BITFIELD(ObjCImplementationAttr, DeclAttribute, 3,
@@ -580,6 +622,9 @@ public:
                                      DeclAttrKind kind, SourceLoc atLoc,
                                      SourceLoc attrLoc);
 
+  /// Attaches the attribute to the given declaration.
+  void attachToDecl(Decl *D);
+
   /// Create a copy of this attribute.
   DeclAttribute *clone(ASTContext &ctx) const;
 
@@ -590,6 +635,11 @@ public:
   /// would have the same effect on \p attachedTo were they attached to it. A
   /// clone should always be equivalent to the original.
   bool isEquivalent(const DeclAttribute *other, Decl *attachedTo) const;
+
+private:
+  void attachToDeclImpl(Decl *D) {
+    // Most attributes don't need any custom logic for this.
+  }
 };
 
 #define UNIMPLEMENTED_CLONE(AttrType)    \
@@ -666,7 +716,7 @@ public:
   }
 };
 
-/// Defines the @_section attribute.
+/// Defines the @section attribute.
 class SectionAttr : public DeclAttribute {
 public:
   SectionAttr(StringRef Name, SourceLoc AtLoc, SourceRange Range, bool Implicit)
@@ -695,22 +745,29 @@ public:
 /// Defines the @_cdecl attribute.
 class CDeclAttr : public DeclAttribute {
 public:
-  CDeclAttr(StringRef Name, SourceLoc AtLoc, SourceRange Range, bool Implicit)
-      : DeclAttribute(DeclAttrKind::CDecl, AtLoc, Range, Implicit), Name(Name) {
+  CDeclAttr(StringRef Name, SourceLoc AtLoc, SourceRange Range, bool Implicit,
+            bool Underscored)
+      : DeclAttribute(DeclAttrKind::CDecl, AtLoc, Range, Implicit),
+        Name(Name), Underscored(Underscored) {
   }
 
-  CDeclAttr(StringRef Name, bool Implicit)
-    : CDeclAttr(Name, SourceLoc(), SourceRange(), Implicit) {}
+  CDeclAttr(StringRef Name, bool Implicit, bool Underscored)
+    : CDeclAttr(Name, SourceLoc(), SourceRange(), Implicit, Underscored) {}
 
   /// The symbol name.
   const StringRef Name;
+
+  /// Is this the version of the attribute that's underscored?
+  /// Used to preserve retro compatibility with early adopters.
+  const bool Underscored;
 
   static bool classof(const DeclAttribute *DA) {
     return DA->getKind() == DeclAttrKind::CDecl;
   }
 
   CDeclAttr *clone(ASTContext &ctx) const {
-    return new (ctx) CDeclAttr(Name, AtLoc, Range, isImplicit());
+    return new (ctx) CDeclAttr(Name, AtLoc, Range, isImplicit(),
+                               Underscored);
   }
 
   bool isEquivalent(const CDeclAttr *other, Decl *attachedTo) const {
@@ -1053,7 +1110,7 @@ class ObjCAttr final : public DeclAttribute,
     unsigned length = 2;
     if (auto name = getName())
       length += name->getNumSelectorPieces();
-    return {getTrailingObjects<SourceLoc>(), length};
+    return getTrailingObjects(length);
   }
 
   /// Retrieve the trailing location information.
@@ -1062,7 +1119,7 @@ class ObjCAttr final : public DeclAttribute,
     unsigned length = 2;
     if (auto name = getName())
       length += name->getNumSelectorPieces();
-    return {getTrailingObjects<SourceLoc>(), length};
+    return getTrailingObjects(length);
   }
 
 public:
@@ -1208,19 +1265,22 @@ class DynamicReplacementAttr final
   friend class DynamicallyReplacedDeclRequest;
 
   DeclNameRef ReplacedFunctionName;
+  DeclNameLoc ReplacedFunctionNameLoc;
   LazyMemberLoader *Resolver = nullptr;
   uint64_t ResolverContextData;
 
   /// Create an @_dynamicReplacement(for:) attribute written in the source.
   DynamicReplacementAttr(SourceLoc atLoc, SourceRange baseRange,
                          DeclNameRef replacedFunctionName,
+                         DeclNameLoc replacedFunctionNameLoc,
                          SourceRange parenRange);
 
   DynamicReplacementAttr(DeclNameRef name, AbstractFunctionDecl *f)
       : DeclAttribute(DeclAttrKind::DynamicReplacement, SourceLoc(),
                       SourceRange(),
                       /*Implicit=*/false),
-        ReplacedFunctionName(name), Resolver(nullptr), ResolverContextData(0) {
+        ReplacedFunctionName(name), ReplacedFunctionNameLoc(),
+        Resolver(nullptr), ResolverContextData(0) {
     Bits.DynamicReplacementAttr.HasTrailingLocationInfo = false;
   }
 
@@ -1229,8 +1289,8 @@ class DynamicReplacementAttr final
       : DeclAttribute(DeclAttrKind::DynamicReplacement, SourceLoc(),
                       SourceRange(),
                       /*Implicit=*/false),
-        ReplacedFunctionName(name), Resolver(Resolver),
-        ResolverContextData(Data) {
+        ReplacedFunctionName(name), ReplacedFunctionNameLoc(),
+        Resolver(Resolver), ResolverContextData(Data) {
     Bits.DynamicReplacementAttr.HasTrailingLocationInfo = false;
   }
 
@@ -1238,20 +1298,21 @@ class DynamicReplacementAttr final
   MutableArrayRef<SourceLoc> getTrailingLocations() {
     assert(Bits.DynamicReplacementAttr.HasTrailingLocationInfo);
     unsigned length = 2;
-    return {getTrailingObjects<SourceLoc>(), length};
+    return getTrailingObjects(length);
   }
 
   /// Retrieve the trailing location information.
   ArrayRef<SourceLoc> getTrailingLocations() const {
     assert(Bits.DynamicReplacementAttr.HasTrailingLocationInfo);
     unsigned length = 2; // lParens, rParens
-    return {getTrailingObjects<SourceLoc>(), length};
+    return getTrailingObjects(length);
   }
 
 public:
   static DynamicReplacementAttr *
   create(ASTContext &Context, SourceLoc AtLoc, SourceLoc DynReplLoc,
-         SourceLoc LParenLoc, DeclNameRef replacedFunction, SourceLoc RParenLoc);
+         SourceLoc LParenLoc, DeclNameRef replacedFunction,
+         DeclNameLoc replacedFunctionNameLoc, SourceLoc RParenLoc);
 
   static DynamicReplacementAttr *create(ASTContext &ctx,
                                         DeclNameRef replacedFunction,
@@ -1264,6 +1325,10 @@ public:
 
   DeclNameRef getReplacedFunctionName() const {
     return ReplacedFunctionName;
+  }
+
+  DeclNameLoc getReplacedFunctionNameLoc() const {
+    return ReplacedFunctionNameLoc;
   }
 
   /// Retrieve the location of the opening parentheses, if there is one.
@@ -1435,8 +1500,7 @@ public:
   /// Note: A single SPI name per attribute is currently supported but this
   /// may change with the syntax change.
   ArrayRef<Identifier> getSPIGroups() const {
-    return { this->template getTrailingObjects<Identifier>(),
-             numSPIGroups };
+    return getTrailingObjects(numSPIGroups);
   }
 
   static bool classof(const DeclAttribute *DA) {
@@ -1692,12 +1756,13 @@ class SynthesizedProtocolAttr : public DeclAttribute {
 
 public:
   SynthesizedProtocolAttr(ProtocolDecl *protocol, LazyConformanceLoader *Loader,
-                          bool isUnchecked)
+                          bool isUnchecked, bool isSuppressed)
       : DeclAttribute(DeclAttrKind::SynthesizedProtocol, SourceLoc(),
                       SourceRange(),
                       /*Implicit=*/true),
         Loader(Loader), protocol(protocol) {
     Bits.SynthesizedProtocolAttr.isUnchecked = unsigned(isUnchecked);
+    Bits.SynthesizedProtocolAttr.isSuppressed = unsigned(isSuppressed);
   }
 
   /// Retrieve the known protocol kind naming the protocol to be
@@ -1710,6 +1775,10 @@ public:
     return bool(Bits.SynthesizedProtocolAttr.isUnchecked);
   }
 
+  bool isSuppressed() const {
+    return bool(Bits.SynthesizedProtocolAttr.isSuppressed);
+  }
+
   /// Retrieve the lazy loader that will be used to populate the
   /// synthesized conformance.
   LazyConformanceLoader *getLazyLoader() const { return Loader; }
@@ -1720,26 +1789,29 @@ public:
 
   SynthesizedProtocolAttr *clone(ASTContext &ctx) const {
     return new (ctx) SynthesizedProtocolAttr(
-        protocol, getLazyLoader(), isUnchecked());
+        protocol, getLazyLoader(), isUnchecked(), isSuppressed());
   }
 
   bool isEquivalent(const SynthesizedProtocolAttr *other,
                     Decl *attachedTo) const {
     return isUnchecked() == other->isUnchecked()
+            && isSuppressed() == other->isSuppressed()
             && getProtocol() == other->getProtocol()
             && getLazyLoader() == other->getLazyLoader();
   }
 };
 
-/// The @_specialize attribute, which forces specialization on the specified
-/// type list.
-class SpecializeAttr final
+/// The @_specialize/@specialize attribute, which forces specialization on the
+/// specified type list.
+template<typename Base, typename...AdditionalTrailingObjects>
+using SpecializeAttrTrailingObjects = llvm::TrailingObjects<Base,
+  Identifier, AvailableAttr *, Type , AdditionalTrailingObjects...>;
+
+class AbstractSpecializeAttr
     : public DeclAttribute,
-      private llvm::TrailingObjects<SpecializeAttr, Identifier,
-                                    AvailableAttr *, Type> {
+      private llvm::trailing_objects_internal::TrailingObjectsBase {
   friend class SpecializeAttrTargetDeclRequest;
   friend class SerializeAttrGenericSignatureRequest;
-  friend TrailingObjects;
 
 public:
   // NOTE: When adding new kinds, you must update the inline bitfield macro.
@@ -1753,6 +1825,7 @@ private:
   GenericSignature specializedSignature;
 
   DeclNameRef targetFunctionName;
+  DeclNameLoc targetFunctionNameLoc;
   LazyMemberLoader *resolver = nullptr;
   uint64_t resolverContextData;
   size_t numSPIGroups;
@@ -1760,18 +1833,147 @@ private:
   size_t numTypeErasedParams;
   bool typeErasedParamsInitialized;
 
-  SpecializeAttr(SourceLoc atLoc, SourceRange Range,
-                 TrailingWhereClause *clause, bool exported,
+protected:
+  AbstractSpecializeAttr(DeclAttrKind DK, SourceLoc atLoc, SourceRange Range,
+                 TrailingWhereClause *clause,
+                 bool exported,
                  SpecializationKind kind, GenericSignature specializedSignature,
-                 DeclNameRef targetFunctionName, ArrayRef<Identifier> spiGroups,
+                 DeclNameRef targetFunctionName,
+                 DeclNameLoc targetFunctionNameLoc,
+                 ArrayRef<Identifier> spiGroups,
                  ArrayRef<AvailableAttr *> availabilityAttrs,
                  size_t typeErasedParamsCount);
 
 public:
+  size_t numTrailingObjects(OverloadToken<Identifier>) const {
+    return numSPIGroups;
+  }
+
+  size_t numTrailingObjects(OverloadToken<AvailableAttr *>) const {
+    return numAvailableAttrs;
+  }
+  // Helper to get the trailing objects of one of the subclasses.
+  template<typename Type>
+  const Type *getSubclassTrailingObjects() const;
+
+  template<typename Type>
+  Type *getSubclassTrailingObjects() {
+    const auto *constThis = this;
+    return const_cast<Type*>(constThis->getSubclassTrailingObjects<Type>());
+  }
+
+  /// Name of SPIs declared by the attribute.
+  ///
+  /// Note: A single SPI name per attribute is currently supported but this
+  /// may change with the syntax change.
+  ArrayRef<Identifier> getSPIGroups() const {
+    return { getSubclassTrailingObjects<Identifier>(),
+             numSPIGroups };
+  }
+
+  ArrayRef<AvailableAttr *> getAvailableAttrs() const {
+    return {getSubclassTrailingObjects<AvailableAttr *>(),
+            numAvailableAttrs};
+  }
+
+  ArrayRef<Type> getTypeErasedParams() const {
+    if (!typeErasedParamsInitialized)
+      return {};
+
+    return {getSubclassTrailingObjects<Type>(),
+            numTypeErasedParams};
+  }
+
+  void setTypeErasedParams(const ArrayRef<Type> typeErasedParams) {
+    assert(typeErasedParams.size() == numTypeErasedParams);
+    if (!typeErasedParamsInitialized) {
+      std::uninitialized_copy(typeErasedParams.begin(), typeErasedParams.end(),
+                              getSubclassTrailingObjects<Type>());
+      typeErasedParamsInitialized = true;
+    }
+  }
+
+  void setResolver(LazyMemberLoader *resolver, uint64_t resolverContextData) {
+    this->resolver = resolver;
+    this->resolverContextData = resolverContextData;
+  }
+
+  TrailingWhereClause *getTrailingWhereClause() const;
+
+  bool isPublic() const {
+    return getKind() == DeclAttrKind::Specialized;
+  }
+
+  bool isExported() const {
+    return Bits.AbstractSpecializeAttr.exported;
+  }
+
+  SpecializationKind getSpecializationKind() const {
+    return SpecializationKind(Bits.AbstractSpecializeAttr.kind);
+  }
+
+  bool isFullSpecialization() const {
+    return getSpecializationKind() == SpecializationKind::Full;
+  }
+
+  bool isPartialSpecialization() const {
+    return getSpecializationKind() == SpecializationKind::Partial;
+  }
+
+  DeclNameRef getTargetFunctionName() const {
+    return targetFunctionName;
+  }
+
+  DeclNameLoc getTargetFunctionNameLoc() const {
+    return targetFunctionNameLoc;
+  }
+
+  /// \p forDecl is the value decl that the attribute belongs to.
+  ValueDecl *getTargetFunctionDecl(const ValueDecl *forDecl) const;
+
+  /// \p forDecl is the value decl that the attribute belongs to.
+  GenericSignature
+  getSpecializedSignature(const AbstractFunctionDecl *forDecl) const;
+
+  static bool classof(const DeclAttribute *DA) {
+    return DA->getKind() == DeclAttrKind::Specialize ||
+      DA->getKind() == DeclAttrKind::Specialized;
+  }
+
+  UNIMPLEMENTED_CLONE(AbstractSpecializeAttr)
+
+  bool isEquivalent(const AbstractSpecializeAttr *other, Decl *attachedTo) const;
+};
+
+/// The @_specialize attribute.
+class SpecializeAttr final : public AbstractSpecializeAttr,
+   private SpecializeAttrTrailingObjects<SpecializeAttr> {
+  friend TrailingObjects;
+  friend AbstractSpecializeAttr;
+
+  // WARNING: Do not add storage here. The base class uses TrailingObjects.
+private:
+  SpecializeAttr(SourceLoc atLoc, SourceRange Range,
+                 TrailingWhereClause *clause,
+                 bool exported,
+                 SpecializationKind kind, GenericSignature specializedSignature,
+                 DeclNameRef targetFunctionName,
+                 DeclNameLoc targetFunctionNameLoc,
+                 ArrayRef<Identifier> spiGroups,
+                 ArrayRef<AvailableAttr *> availabilityAttrs,
+                 size_t typeErasedParamsCount) :
+    AbstractSpecializeAttr(DeclAttrKind::Specialize, atLoc, Range, clause,
+                   exported, kind, specializedSignature, targetFunctionName,
+                   targetFunctionNameLoc, spiGroups, availabilityAttrs,
+                   typeErasedParamsCount) {}
+
+public:
   static SpecializeAttr *
   create(ASTContext &Ctx, SourceLoc atLoc, SourceRange Range,
-         TrailingWhereClause *clause, bool exported, SpecializationKind kind,
-         DeclNameRef targetFunctionName, ArrayRef<Identifier> spiGroups,
+         TrailingWhereClause *clause, bool exported,
+         SpecializationKind kind,
+         DeclNameRef targetFunctionName, DeclNameLoc targetFunctionNameLoc,
+         ArrayRef<Identifier> spiGroups,
          ArrayRef<AvailableAttr *> availabilityAttrs,
          GenericSignature specializedSignature = nullptr);
 
@@ -1791,80 +1993,89 @@ public:
                                 DeclNameRef replacedFunction,
                                 LazyMemberLoader *resolver, uint64_t data);
 
-  size_t numTrailingObjects(OverloadToken<Identifier>) const {
-    return numSPIGroups;
-  }
-
-  size_t numTrailingObjects(OverloadToken<AvailableAttr *>) const {
-    return numAvailableAttrs;
-  }
-  /// Name of SPIs declared by the attribute.
-  ///
-  /// Note: A single SPI name per attribute is currently supported but this
-  /// may change with the syntax change.
-  ArrayRef<Identifier> getSPIGroups() const {
-    return { this->template getTrailingObjects<Identifier>(),
-             numSPIGroups };
-  }
-
-  ArrayRef<AvailableAttr *> getAvailableAttrs() const {
-    return {this->template getTrailingObjects<AvailableAttr *>(),
-            numAvailableAttrs};
-  }
-
-  ArrayRef<Type> getTypeErasedParams() const {
-    if (!typeErasedParamsInitialized)
-      return {};
-
-    return {this->template getTrailingObjects<Type>(),
-            numTypeErasedParams};
-  }
-
-  void setTypeErasedParams(const ArrayRef<Type> typeErasedParams) {
-    assert(typeErasedParams.size() == numTypeErasedParams);
-    if (!typeErasedParamsInitialized) {
-      std::uninitialized_copy(typeErasedParams.begin(), typeErasedParams.end(), getTrailingObjects<Type>());
-      typeErasedParamsInitialized = true;
-    }
-  }
-
-  TrailingWhereClause *getTrailingWhereClause() const;
-
-  bool isExported() const {
-    return Bits.SpecializeAttr.exported;
-  }
-
-  SpecializationKind getSpecializationKind() const {
-    return SpecializationKind(Bits.SpecializeAttr.kind);
-  }
-
-  bool isFullSpecialization() const {
-    return getSpecializationKind() == SpecializationKind::Full;
-  }
-
-  bool isPartialSpecialization() const {
-    return getSpecializationKind() == SpecializationKind::Partial;
-  }
-
-  DeclNameRef getTargetFunctionName() const {
-    return targetFunctionName;
-  }
-
-  /// \p forDecl is the value decl that the attribute belongs to.
-  ValueDecl *getTargetFunctionDecl(const ValueDecl *forDecl) const;
-
-  /// \p forDecl is the value decl that the attribute belongs to.
-  GenericSignature
-  getSpecializedSignature(const AbstractFunctionDecl *forDecl) const;
-
   static bool classof(const DeclAttribute *DA) {
     return DA->getKind() == DeclAttrKind::Specialize;
   }
 
   UNIMPLEMENTED_CLONE(SpecializeAttr)
 
-  bool isEquivalent(const SpecializeAttr *other, Decl *attachedTo) const;
+  bool isEquivalent(const SpecializeAttr *other, Decl *attachedTo) const {
+    return AbstractSpecializeAttr::isEquivalent(other, attachedTo);
+  }
 };
+
+/// The @specialized attribute.
+class SpecializedAttr final : public AbstractSpecializeAttr ,
+   private SpecializeAttrTrailingObjects<SpecializeAttr> {
+  friend TrailingObjects;
+  friend AbstractSpecializeAttr;
+
+  // WARNING: Do not add storage here. The base class uses TrailingObjects.
+private:
+
+  SpecializedAttr(SourceLoc atLoc, SourceRange Range,
+                 TrailingWhereClause *clause,
+                 bool exported,
+                 SpecializationKind kind, GenericSignature specializedSignature,
+                 DeclNameRef targetFunctionName,
+                 DeclNameLoc targetFunctionNameLoc,
+                 ArrayRef<Identifier> spiGroups,
+                 ArrayRef<AvailableAttr *> availabilityAttrs,
+                 size_t typeErasedParamsCount) :
+    AbstractSpecializeAttr(DeclAttrKind::Specialized, atLoc, Range, clause,
+                   exported, kind, specializedSignature, targetFunctionName,
+                   targetFunctionNameLoc, spiGroups, availabilityAttrs,
+                   typeErasedParamsCount) {}
+
+public:
+  static SpecializedAttr *
+  create(ASTContext &Ctx, SourceLoc atLoc, SourceRange Range,
+         TrailingWhereClause *clause, bool exported,
+         SpecializationKind kind,
+         DeclNameRef targetFunctionName, DeclNameLoc targetFunctionNameLoc,
+         ArrayRef<Identifier> spiGroups,
+         ArrayRef<AvailableAttr *> availabilityAttrs,
+         GenericSignature specializedSignature = nullptr);
+
+  static SpecializedAttr *create(ASTContext &ctx, bool exported,
+                                SpecializationKind kind,
+                                ArrayRef<Identifier> spiGroups,
+                                ArrayRef<AvailableAttr *> availabilityAttrs,
+                                GenericSignature specializedSignature,
+                                DeclNameRef replacedFunction);
+
+  static SpecializedAttr *create(ASTContext &ctx, bool exported,
+                                SpecializationKind kind,
+                                ArrayRef<Identifier> spiGroups,
+                                ArrayRef<AvailableAttr *> availabilityAttrs,
+                                ArrayRef<Type> typeErasedParams,
+                                GenericSignature specializedSignature,
+                                DeclNameRef replacedFunction,
+                                LazyMemberLoader *resolver, uint64_t data);
+
+  static bool classof(const DeclAttribute *DA) {
+    return DA->getKind() == DeclAttrKind::Specialized;
+  }
+
+  UNIMPLEMENTED_CLONE(SpecializedAttr)
+
+  bool isEquivalent(const SpecializedAttr *other, Decl *attachedTo) const {
+    return AbstractSpecializeAttr::isEquivalent(other, attachedTo);
+  }
+};
+
+template<typename Type>
+const Type *AbstractSpecializeAttr::getSubclassTrailingObjects() const {
+  if (auto attr = dyn_cast<SpecializedAttr>(this)) {
+    return attr->getTrailingObjects<Type>();
+  }
+  if (auto attr = dyn_cast<SpecializeAttr>(this)) {
+    return attr->getTrailingObjects<Type>();
+  }
+  llvm_unreachable("unhandled AbstractSpecializeAttr subclass?");
+}
+
+
 
 class StorageRestrictionsAttr final
     : public DeclAttribute,
@@ -1888,11 +2099,11 @@ public:
   unsigned getNumAccessesProperties() const { return NumAccesses; }
 
   ArrayRef<Identifier> getInitializesNames() const {
-    return {getTrailingObjects<Identifier>(), NumInitializes};
+    return getTrailingObjects(NumInitializes);
   }
 
   ArrayRef<Identifier> getAccessesNames() const {
-    return {getTrailingObjects<Identifier>() + NumInitializes, NumAccesses};
+    return {getTrailingObjects() + NumInitializes, NumAccesses};
   }
 
   ArrayRef<VarDecl *> getInitializesProperties(AccessorDecl *attachedTo) const;
@@ -2102,33 +2313,71 @@ public:
   }
 };
 
+/// The owning decl for a given custom attribute, or a DeclContext for a
+/// custom attribute in e.g a closure or inheritance clause.
+class CustomAttrOwner final {
+  llvm::PointerUnion<Decl *, DeclContext *> Owner;
+
+public:
+  CustomAttrOwner() : Owner(nullptr) {}
+  CustomAttrOwner(Decl *D) : Owner(D) {}
+  CustomAttrOwner(DeclContext *DC) : Owner(DC) {}
+
+  /// If the owner is a declaration, returns it, \c nullptr otherwise.
+  Decl *getAsDecl() const { return Owner.dyn_cast<Decl *>(); }
+
+  /// Retrieve the DeclContext for the CustomAttr.
+  DeclContext *getDeclContext() const;
+};
+
 /// Defines a custom attribute.
 class CustomAttr final : public DeclAttribute {
+  friend class DeclAttribute;
+
   TypeExpr *typeExpr;
   ArgumentList *argList;
+  CustomAttrOwner owner;
   CustomAttributeInitializer *initContext;
   Expr *semanticInit = nullptr;
 
   mutable unsigned isArgUnsafeBit : 1;
 
   CustomAttr(SourceLoc atLoc, SourceRange range, TypeExpr *type,
-             CustomAttributeInitializer *initContext, ArgumentList *argList,
-             bool implicit);
+             CustomAttrOwner owner, CustomAttributeInitializer *initContext,
+             ArgumentList *argList, bool implicit);
 
 public:
   static CustomAttr *create(ASTContext &ctx, SourceLoc atLoc, TypeExpr *type,
-                            bool implicit = false) {
-    return create(ctx, atLoc, type, /*initContext*/ nullptr,
+                            CustomAttrOwner owner, bool implicit = false) {
+    return create(ctx, atLoc, type, owner, /*initContext*/ nullptr,
                   /*argList*/ nullptr, implicit);
   }
 
   static CustomAttr *create(ASTContext &ctx, SourceLoc atLoc, TypeExpr *type,
+                            CustomAttrOwner owner,
                             CustomAttributeInitializer *initContext,
                             ArgumentList *argList, bool implicit = false);
 
   TypeExpr *getTypeExpr() const { return typeExpr; }
   TypeRepr *getTypeRepr() const;
   Type getType() const;
+
+  /// Retrieve the Decl or DeclContext owner for the attribute.
+  CustomAttrOwner getOwner() const { return owner; }
+
+  ASTContext &getASTContext() const;
+
+  /// If \c true, we should prefer a property wrapper if one exists for the
+  /// given attribute over a macro.
+  bool shouldPreferPropertyWrapperOverMacro() const;
+
+  /// Retrieve the NominalTypeDecl the CustomAttr refers to, or \c nullptr if
+  /// it doesn't refer to one (which can be the case for e.g macro attrs).
+  NominalTypeDecl *getNominalDecl() const;
+
+  /// Retrieve the resolved macro for the CustomAttr, or \c nullptr if the
+  /// attribute does not refer to a macro.
+  MacroDecl *getResolvedMacro() const;
 
   /// Destructure an attribute's type repr for a macro reference.
   ///
@@ -2166,18 +2415,22 @@ public:
   CustomAttr *clone(ASTContext &ctx) const {
     assert(argList == nullptr &&
            "Cannot clone custom attribute with an argument list");
-    return create(ctx, AtLoc, getTypeExpr(), initContext, argList, isImplicit());
+    return create(ctx, AtLoc, getTypeExpr(), owner, initContext, argList,
+                  isImplicit());
   }
 
   bool canClone() const { return argList == nullptr; }
 
   bool isEquivalent(const CustomAttr *other, Decl *attachedTo) const;
 
+  void printCustomAttr(ASTPrinter &Printer, const PrintOptions &Options) const;
+
 private:
+  void attachToDeclImpl(Decl *D);
+
   friend class CustomAttrNominalRequest;
   void resetTypeInformation(TypeExpr *repr);
 
-private:
   friend class CustomAttrTypeRequest;
   void setType(Type ty);
 };
@@ -2228,6 +2481,11 @@ public:
 /// The variable \p foo was originally defined in another module called
 /// \p Original prior to OSX 10.15
 class OriginallyDefinedInAttr: public DeclAttribute {
+  const StringRef ManglingModuleName;
+  const StringRef LinkerModuleName;
+  const PlatformKind Platform;
+  const llvm::VersionTuple MovedVersion;
+
 public:
   OriginallyDefinedInAttr(SourceLoc AtLoc, SourceRange Range,
                           StringRef OriginalModuleName,
@@ -2249,16 +2507,22 @@ public:
   OriginallyDefinedInAttr *clone(ASTContext &C, bool implicit) const;
 
   // The original module name for mangling.
-  const StringRef ManglingModuleName;
+  StringRef getManglingModuleName() const { return ManglingModuleName; }
 
   // The original module name for linker directives.
-  const StringRef LinkerModuleName;
+  StringRef getLinkerModuleName() const { return LinkerModuleName; }
 
   /// The platform of the symbol.
-  const PlatformKind Platform;
+  PlatformKind getPlatform() const { return Platform; }
 
-  /// Indicates when the symbol was moved here.
-  const llvm::VersionTuple MovedVersion;
+  /// The version of the platform that the symbol was moved in, as it was
+  /// written in source.
+  llvm::VersionTuple getParsedMovedVersion() const { return MovedVersion; }
+
+  /// The version of the platform that the symbol was moved in. This may be
+  /// different than the version that was written in source due to
+  /// canonicalization.
+  llvm::VersionTuple getMovedVersion() const;
 
   struct ActiveVersion {
     StringRef ManglingModuleName;
@@ -2303,6 +2567,7 @@ class DifferentiableAttr final
                                     ParsedAutoDiffParameter> {
   friend TrailingObjects;
   friend class DifferentiableAttributeTypeCheckRequest;
+  friend class DeclAttribute;
 
   /// The declaration on which the `@differentiable` attribute is declared.
   /// May not be a valid declaration for `@differentiable` attributes.
@@ -2362,11 +2627,9 @@ public:
 
   Decl *getOriginalDeclaration() const { return OriginalDeclaration; }
 
-  /// Sets the original declaration on which this attribute is declared.
-  /// Should only be used by parsing and deserialization.
-  void setOriginalDeclaration(Decl *originalDeclaration);
-
 private:
+  void attachToDeclImpl(Decl *D);
+
   /// Returns true if the given `@differentiable` attribute has been
   /// type-checked.
   bool hasBeenTypeChecked() const;
@@ -2378,10 +2641,10 @@ public:
   /// The parsed differentiability parameters, i.e. the list of parameters
   /// specified in 'wrt:'.
   ArrayRef<ParsedAutoDiffParameter> getParsedParameters() const {
-    return {getTrailingObjects<ParsedAutoDiffParameter>(), NumParsedParameters};
+    return getTrailingObjects(NumParsedParameters);
   }
   MutableArrayRef<ParsedAutoDiffParameter> getParsedParameters() {
-    return {getTrailingObjects<ParsedAutoDiffParameter>(), NumParsedParameters};
+    return getTrailingObjects(NumParsedParameters);
   }
   size_t numTrailingObjects(OverloadToken<ParsedAutoDiffParameter>) const {
     return NumParsedParameters;
@@ -2481,6 +2744,7 @@ class DerivativeAttr final
       private llvm::TrailingObjects<DerivativeAttr, ParsedAutoDiffParameter> {
   friend TrailingObjects;
   friend class DerivativeAttrOriginalDeclRequest;
+  friend class DeclAttribute;
 
   /// The declaration on which the `@derivative` attribute is declared.
   /// May not be a valid declaration for `@derivative` attributes.
@@ -2541,10 +2805,6 @@ public:
 
   Decl *getOriginalDeclaration() const { return OriginalDeclaration; }
 
-  /// Sets the original declaration on which this attribute is declared.
-  /// Should only be used by parsing and deserialization.
-  void setOriginalDeclaration(Decl *originalDeclaration);
-
   TypeRepr *getBaseTypeRepr() const { return BaseTypeRepr; }
   DeclNameRefWithLoc getOriginalFunctionName() const {
     return OriginalFunctionName;
@@ -2563,10 +2823,10 @@ public:
   /// The parsed differentiability parameters, i.e. the list of parameters
   /// specified in 'wrt:'.
   ArrayRef<ParsedAutoDiffParameter> getParsedParameters() const {
-    return {getTrailingObjects<ParsedAutoDiffParameter>(), NumParsedParameters};
+    return getTrailingObjects(NumParsedParameters);
   }
   MutableArrayRef<ParsedAutoDiffParameter> getParsedParameters() {
-    return {getTrailingObjects<ParsedAutoDiffParameter>(), NumParsedParameters};
+    return getTrailingObjects(NumParsedParameters);
   }
   size_t numTrailingObjects(OverloadToken<ParsedAutoDiffParameter>) const {
     return NumParsedParameters;
@@ -2589,6 +2849,9 @@ public:
     // Not properly implemented (very complex and not currently needed)
     return false;
   }
+
+private:
+  void attachToDeclImpl(Decl *D);
 };
 
 /// The `@transpose(of:)` attribute registers a function as a transpose of
@@ -2654,10 +2917,10 @@ public:
   /// The parsed linearity parameters, i.e. the list of parameters specified in
   /// 'wrt:'.
   ArrayRef<ParsedAutoDiffParameter> getParsedParameters() const {
-    return {getTrailingObjects<ParsedAutoDiffParameter>(), NumParsedParameters};
+    return getTrailingObjects(NumParsedParameters);
   }
   MutableArrayRef<ParsedAutoDiffParameter> getParsedParameters() {
-    return {getTrailingObjects<ParsedAutoDiffParameter>(), NumParsedParameters};
+    return getTrailingObjects(NumParsedParameters);
   }
   size_t numTrailingObjects(OverloadToken<ParsedAutoDiffParameter>) const {
     return NumParsedParameters;
@@ -2691,6 +2954,35 @@ enum class NonSendableKind : uint8_t {
   /// A '@_nonSendable(_assumed)' attribute. Should be applied to large swaths
   /// of declarations; does not override explicit 'Sendable' conformances.
   Assumed
+};
+
+/// Specify whether the declaration should be exported as an interface or
+/// an implementation.
+class ExportAttr : public DeclAttribute {
+public:
+  /// How this declaration is exported.
+  const ExportKind exportKind;
+
+  ExportAttr(SourceLoc atLoc, SourceRange range, ExportKind exportKind,
+             bool implicit = false)
+      : DeclAttribute(DeclAttrKind::Export, atLoc, range, implicit),
+        exportKind(exportKind) {}
+
+  ExportAttr(ExportKind exportKind, bool implicit = false)
+    : ExportAttr(SourceLoc(), SourceRange(), exportKind, implicit) { }
+
+  static bool classof(const DeclAttribute *DA) {
+    return DA->getKind() == DeclAttrKind::Export;
+  }
+
+  /// Create a copy of this attribute.
+  ExportAttr *clone(ASTContext &ctx) const {
+    return new (ctx) ExportAttr(AtLoc, Range, exportKind, isImplicit());
+  }
+
+  bool isEquivalent(const ExportAttr *other, Decl *attachedTo) const {
+    return exportKind == other->exportKind;
+  }
 };
 
 /// Marks a declaration as explicitly non-Sendable.
@@ -2757,20 +3049,34 @@ public:
 /// available for back deployment to older OSes via emission into the client
 /// binary.
 class BackDeployedAttr : public DeclAttribute {
+  const PlatformKind Platform;
+  const llvm::VersionTuple Version;
+
 public:
   BackDeployedAttr(SourceLoc AtLoc, SourceRange Range, PlatformKind Platform,
                    const llvm::VersionTuple &Version, bool Implicit)
       : DeclAttribute(DeclAttrKind::BackDeployed, AtLoc, Range, Implicit),
         Platform(Platform), Version(Version) {}
 
-  /// The platform the symbol is available for back deployment on.
-  const PlatformKind Platform;
+  /// The platform the decl is available for back deployment in.
+  PlatformKind getPlatform() const { return Platform; }
 
-  /// The earliest platform version that may use the back deployed implementation.
-  const llvm::VersionTuple Version;
+  /// The `before:` version tuple that was written in source.
+  llvm::VersionTuple getParsedVersion() const { return Version; }
+
+  /// The `before:` version, which is the earliest platform version that may use
+  /// the back deployed implementation. This may be different from the version
+  /// that was written in source due to canonicalization.
+  llvm::VersionTuple getVersion() const;
 
   /// Returns true if this attribute is active given the current platform.
   bool isActivePlatform(const ASTContext &ctx, bool forTargetVariant) const;
+
+  /// Returns the `AvailabilityDomain` that the decl is available for back
+  /// deployment in.
+  AvailabilityDomain getAvailabilityDomain() const {
+    return AvailabilityDomain::forPlatform(Platform);
+  }
 
   static bool classof(const DeclAttribute *DA) {
     return DA->getKind() == DeclAttrKind::BackDeployed;
@@ -2861,11 +3167,11 @@ public:
   }
 
   /// Returns the C name of the given declaration.
-  /// \p forDecl is the func decl that the attribute belongs to.
-  StringRef getCName(const FuncDecl *forDecl) const;
+  /// \p forDecl is the decl that the attribute belongs to.
+  StringRef getCName(const ValueDecl *forDecl) const;
 
   /// Find an ExternAttr with the given kind in the given DeclAttributes.
-  static ExternAttr *find(DeclAttributes &attrs, ExternKind kind);
+  static const ExternAttr *find(const DeclAttributes &attrs, ExternKind kind);
 
   static bool classof(const DeclAttribute *DA) {
     return DA->getKind() == DeclAttrKind::Extern;
@@ -3294,8 +3600,8 @@ public:
   bool getInverted() const { return Bits.AllowFeatureSuppressionAttr.Inverted; }
 
   ArrayRef<Identifier> getSuppressedFeatures() const {
-    return {getTrailingObjects<Identifier>(),
-            static_cast<size_t>(Bits.AllowFeatureSuppressionAttr.NumFeatures)};
+    return getTrailingObjects(
+        static_cast<size_t>(Bits.AllowFeatureSuppressionAttr.NumFeatures));
   }
 
   static bool classof(const DeclAttribute *DA) {
@@ -3310,6 +3616,8 @@ public:
 
 /// Defines the @abi attribute.
 class ABIAttr : public DeclAttribute {
+  friend class DeclAttribute;
+
 public:
   ABIAttr(Decl *abiDecl, SourceLoc AtLoc, SourceRange Range, bool Implicit)
       : DeclAttribute(DeclAttrKind::ABI, AtLoc, Range, Implicit),
@@ -3336,6 +3644,9 @@ public:
     // Unsupported: tricky to implement and unneeded.
     return true;
   }
+
+private:
+  void attachToDeclImpl(Decl *D);
 };
 
 /// Defines a @nonexhaustive attribute.
@@ -3366,6 +3677,10 @@ public:
     return getMode() == other->getMode();
   }
 };
+
+
+/// The kind of unary operator, if any.
+enum class UnaryOperatorKind : uint8_t { None, Prefix, Postfix };
 
 /// Attributes that may be applied to declarations.
 class DeclAttributes {
@@ -3727,11 +4042,11 @@ public:
 
   /// Returns the effective obsoletion range indicated by this attribute, along
   /// with the domain that it applies to (which may be different than the domain
-  /// which the attribute was written with if a remap is required). This always
-  /// corresponds to the version specified by the `obsoleted:` component
-  /// (remapped or canonicalized if necessary). Returns `std::nullopt` if the
-  /// attribute does not indicate obsoletion (note that unavailability is
-  /// separate from obsoletion.
+  /// which the attribute was written with if a remap is required). This may
+  /// correspond to the version specified by the `obsoleted:` component
+  /// (remapped or canonicalized if necessary) or it may be "always" if the
+  /// attribute represents unconditional unavailability. Returns `std::nullopt`
+  /// if the attribute does not indicate obsoletion.
   std::optional<AvailabilityDomainAndRange>
   getObsoletedDomainAndRange(const ASTContext &ctx) const;
 
@@ -3771,7 +4086,7 @@ public:
 
   /// Whether this is a language mode specific attribute.
   bool isSwiftLanguageModeSpecific() const {
-    return getDomain().isSwiftLanguage() && isVersionSpecific();
+    return getDomain().isSwiftLanguageMode() && isVersionSpecific();
   }
 
   /// Whether this is a PackageDescription version specific attribute.
@@ -3871,6 +4186,10 @@ public:
   TypeAttrKind getKind() const {
     return TypeAttrKind(Bits.TypeAttribute.Kind);
   }
+
+  /// - Note: Do not call this directly when emitting a diagnostic. Instead,
+  /// define the diagnostic to accept a `const TypeAttribute *` and use the
+  /// appropriate format specifier.
   const char *getAttrName() const {
     return getAttrName(getKind());
   }

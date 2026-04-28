@@ -413,7 +413,8 @@ public:
 void printContext(raw_ostream &os, DeclContext *dc);
 
 bool printRequirementStub(ValueDecl *Requirement, DeclContext *Adopter,
-                          Type AdopterTy, SourceLoc TypeLoc, raw_ostream &OS);
+                          Type AdopterTy, SourceLoc TypeLoc, raw_ostream &OS,
+                          bool withExplicitObjCAttr = false);
 
 /// Print a keyword or punctuator directly by its kind.
 llvm::raw_ostream &operator<<(llvm::raw_ostream &OS, tok keyword);
@@ -441,7 +442,7 @@ StringRef getAccessorKindString(AccessorKind value);
 /// may be called multiple times if the declaration uses suppressible
 /// features.
 void printWithCompatibilityFeatureChecks(ASTPrinter &printer,
-                                         PrintOptions &options,
+                                         const PrintOptions &options,
                                          Decl *decl,
                                          llvm::function_ref<void()> printBody);
 
